@@ -1,0 +1,166 @@
+{
+  "_comment": [
+    "计费内核的跨语言共享测试用例。",
+    "",
+    "前后端各有一份计价实现（Go: internal/pricing，JS: frontend/src/utils/pricing.js），",
+    "两边必须得出完全一致的结果 —— 否则会出现「前端显示 ¥0.80、后端扣 ¥1.20」这类问题，",
+    "而且用户完全无从判断哪个是对的。",
+    "",
+    "所以规则不靠人工同步，而是靠这个文件：",
+    "  后端  internal/pricing/shared_test.go 的 TestSharedPricingCases",
+    "  前端  frontend/scripts/check-pricing.js（node 直接跑，无需测试框架）",
+    "任何一边改了算法却与这里不符，对应的检查就会失败。",
+    "",
+    "字段说明：",
+    "  wantErr 为空/缺省 = 期望成功；否则是期望的错误名（Go 侧的哨兵错误变量名）",
+    "  amountCents / unitCents 单位均为「分」",
+    "  compute 用例默认用顶层 defaultRules；要测「价目表为空」就写 noRules: true",
+    "  （不用 `rules: []` 表达空价目表 —— null / [] / 字段缺失在两种语言里的语义不一致，显式布尔最省事）"
+  ],
+
+  "defaultRules": [
+    { "isColor": false, "paperSize": "A4", "paperType": "plain", "unitCents": 20 },
+    { "isColor": true, "paperSize": "A4", "paperType": "plain", "unitCents": 100 },
+    { "isColor": false, "paperSize": "A3", "paperType": "plain", "unitCents": 50 },
+    { "isColor": false, "paperSize": "A4", "paperType": "photo", "unitCents": 300 }
+  ],
+
+  "parsePageRanges": [
+    { "name": "空串", "in": "", "want": [] },
+    { "name": "单页", "in": "5", "want": [[5, 5]] },
+    { "name": "单区间", "in": "1-3", "want": [[1, 3]] },
+    { "name": "多段空格分隔", "in": "1-5 8 10-12", "want": [[1, 5], [8, 8], [10, 12]] },
+    { "name": "逗号分隔", "in": "1,3,5", "want": [[1, 1], [3, 3], [5, 5]] },
+    { "name": "全角逗号", "in": "1，3", "want": [[1, 1], [3, 3]] },
+    { "name": "顿号", "in": "1、3", "want": [[1, 1], [3, 3]] },
+    { "name": "全角连字符", "in": "1－3", "want": [[1, 3]] },
+    { "name": "破折号", "in": "1—3", "want": [[1, 3]] },
+    { "name": "连字符两侧有空格", "in": "1 - 3", "want": [[1, 3]] },
+    { "name": "起止相同", "in": "4-4", "want": [[4, 4]] },
+    { "name": "起点大于终点", "in": "5-3", "wantErr": "ErrInvalidPageRange" },
+    { "name": "页码为 0", "in": "0-5", "wantErr": "ErrInvalidPageRange" },
+    { "name": "负数", "in": "-5", "wantErr": "ErrInvalidPageRange" },
+    { "name": "多连字符", "in": "1-2-3", "wantErr": "ErrInvalidPageRange" },
+    { "name": "非数字", "in": "abc", "wantErr": "ErrInvalidPageRange" },
+    { "name": "数字混字母", "in": "3abc", "wantErr": "ErrInvalidPageRange" },
+    { "name": "缺少终点", "in": "5-", "wantErr": "ErrInvalidPageRange" }
+  ],
+
+  "normalizePageRange": [
+    { "name": "空串", "in": "", "want": "" },
+    { "name": "单页", "in": "5", "want": "5" },
+    { "name": "单区间", "in": "1-3", "want": "1-3" },
+    { "name": "乱序排好", "in": "5 3 1", "want": "1 3 5" },
+    { "name": "相邻区间合并", "in": "1-3 4-5", "want": "1-5" },
+    { "name": "重叠区间合并", "in": "1-3 2-5", "want": "1-5" },
+    { "name": "跨区间排序后合并", "in": "10-12 1-3 4-6", "want": "1-6 10-12" },
+    { "name": "重复单页去重", "in": "8 8 8", "want": "8" },
+    { "name": "保留不连续的区间", "in": "1-2 5-6", "want": "1-2 5-6" },
+    { "name": "混合分隔符", "in": "3,1-2,7", "want": "1-3 7" },
+    { "name": "非法输入报错", "in": "5-3", "wantErr": "ErrInvalidPageRange" }
+  ],
+
+  "countBilledPages": [
+    { "name": "全部页", "pages": 10, "pageRange": "", "pageSet": "", "want": 10 },
+    { "name": "全部页显式 all", "pages": 10, "pageRange": "", "pageSet": "all", "want": 10 },
+    { "name": "未知 pageSet 按不过滤", "pages": 10, "pageRange": "", "pageSet": "bogus", "want": 10 },
+    { "name": "页数兜底为 1", "pages": 0, "pageRange": "", "pageSet": "", "want": 1 },
+
+    { "name": "区间", "pages": 10, "pageRange": "3-5", "pageSet": "", "want": 3 },
+    { "name": "越界裁剪：4 页填 3-5", "pages": 4, "pageRange": "3-5", "pageSet": "", "want": 2 },
+    { "name": "全部越界", "pages": 4, "pageRange": "10-20", "pageSet": "", "wantErr": "ErrNoPagesSelected" },
+    { "name": "重叠区间只算一次", "pages": 10, "pageRange": "1-3 2-5", "pageSet": "", "want": 5 },
+    { "name": "重复单页只算一次", "pages": 10, "pageRange": "8 8 8", "pageSet": "", "want": 1 },
+
+    { "name": "奇数页", "pages": 5, "pageRange": "", "pageSet": "odd", "want": 3 },
+    { "name": "偶数页", "pages": 5, "pageRange": "", "pageSet": "even", "want": 2 },
+    { "name": "偶数页偶数总页数", "pages": 6, "pageRange": "", "pageSet": "even", "want": 3 },
+    { "name": "单页取偶数无页可打", "pages": 1, "pageRange": "", "pageSet": "even", "wantErr": "ErrNoPagesSelected" },
+    { "name": "单页取奇数", "pages": 1, "pageRange": "", "pageSet": "odd", "want": 1 },
+
+    { "name": "范围后取偶数", "pages": 10, "pageRange": "3-5", "pageSet": "even", "want": 1 },
+    { "name": "范围后取奇数", "pages": 10, "pageRange": "3-5", "pageSet": "odd", "want": 2 },
+    { "name": "范围裁剪后取偶数", "pages": 4, "pageRange": "3-5", "pageSet": "even", "want": 1 },
+    { "name": "范围全越界后取奇数", "pages": 4, "pageRange": "10-20", "pageSet": "odd", "wantErr": "ErrNoPagesSelected" },
+
+    { "name": "偶数页倒序奇数总页数", "pages": 5, "pageRange": "", "pageSet": "even-reverse", "want": 2 },
+    { "name": "偶数页倒序偶数总页数", "pages": 6, "pageRange": "", "pageSet": "even-reverse", "want": 3 },
+    { "name": "偶数页倒序与 even 同价", "pages": 9, "pageRange": "", "pageSet": "even-reverse", "want": 4 },
+    { "name": "偶数页倒序单页退化", "pages": 1, "pageRange": "", "pageSet": "even-reverse", "want": 1 },
+    {
+      "name": "偶数页倒序不能配页码范围",
+      "pages": 10, "pageRange": "1-5", "pageSet": "even-reverse",
+      "wantErr": "ErrUnsupportedCombination"
+    }
+  ],
+
+  "compute": [
+    {
+      "name": "黑白 10 页 1 份", "pages": 10, "copies": 1, "isColor": false,
+      "paperSize": "A4", "paperType": "plain", "pageRange": "", "pageSet": "",
+      "wantBilled": 10, "wantCopies": 1, "wantUnit": 20, "wantAmount": 200, "wantMatched": true
+    },
+    {
+      "name": "黑白 10 页 3 份", "pages": 10, "copies": 3, "isColor": false,
+      "paperSize": "A4", "paperType": "plain", "pageRange": "", "pageSet": "",
+      "wantBilled": 10, "wantCopies": 3, "wantUnit": 20, "wantAmount": 600, "wantMatched": true
+    },
+    {
+      "name": "彩色单价更高", "pages": 10, "copies": 1, "isColor": true,
+      "paperSize": "A4", "paperType": "plain", "pageRange": "", "pageSet": "",
+      "wantBilled": 10, "wantCopies": 1, "wantUnit": 100, "wantAmount": 1000, "wantMatched": true
+    },
+    {
+      "name": "A3 单价更高", "pages": 2, "copies": 1, "isColor": false,
+      "paperSize": "A3", "paperType": "plain", "pageRange": "", "pageSet": "",
+      "wantBilled": 2, "wantCopies": 1, "wantUnit": 50, "wantAmount": 100, "wantMatched": true
+    },
+    {
+      "name": "照片纸单价更高", "pages": 3, "copies": 2, "isColor": false,
+      "paperSize": "A4", "paperType": "photo", "pageRange": "", "pageSet": "",
+      "wantBilled": 3, "wantCopies": 2, "wantUnit": 300, "wantAmount": 1800, "wantMatched": true
+    },
+    {
+      "name": "页码范围只收实际印数", "pages": 10, "copies": 1, "isColor": false,
+      "paperSize": "A4", "paperType": "plain", "pageRange": "3-5", "pageSet": "",
+      "wantBilled": 3, "wantCopies": 1, "wantUnit": 20, "wantAmount": 60, "wantMatched": true
+    },
+    {
+      "name": "范围加份数加奇偶三重叠加", "pages": 20, "copies": 2, "isColor": false,
+      "paperSize": "A4", "paperType": "plain", "pageRange": "1-10", "pageSet": "even",
+      "wantBilled": 5, "wantCopies": 2, "wantUnit": 20, "wantAmount": 200, "wantMatched": true
+    },
+    {
+      "name": "份数兜底为 1", "pages": 5, "copies": 0, "isColor": false,
+      "paperSize": "A4", "paperType": "plain", "pageRange": "", "pageSet": "",
+      "wantBilled": 5, "wantCopies": 1, "wantUnit": 20, "wantAmount": 100, "wantMatched": true
+    },
+    {
+      "name": "大小写不敏感匹配价目", "pages": 1, "copies": 1, "isColor": false,
+      "paperSize": "a4", "paperType": "PLAIN", "pageRange": "", "pageSet": "",
+      "wantBilled": 1, "wantCopies": 1, "wantUnit": 20, "wantAmount": 20, "wantMatched": true
+    },
+    {
+      "name": "未配置的组合走兜底价", "pages": 5, "copies": 1, "isColor": false,
+      "paperSize": "A4", "paperType": "glossy", "pageRange": "", "pageSet": "",
+      "fallbackCents": 7,
+      "wantBilled": 5, "wantCopies": 1, "wantUnit": 7, "wantAmount": 35, "wantMatched": false
+    },
+    {
+      "name": "无价目表时兜底为 0", "pages": 5, "copies": 1, "isColor": false,
+      "paperSize": "A4", "paperType": "plain", "pageRange": "", "pageSet": "",
+      "noRules": true, "fallbackCents": 0,
+      "wantBilled": 5, "wantCopies": 1, "wantUnit": 0, "wantAmount": 0, "wantMatched": false
+    },
+    {
+      "name": "非法页码整体失败", "pages": 10, "copies": 1, "isColor": false,
+      "paperSize": "A4", "paperType": "plain", "pageRange": "5-3", "pageSet": "",
+      "wantErr": "ErrInvalidPageRange"
+    },
+    {
+      "name": "even-reverse 配页码范围整体失败", "pages": 10, "copies": 1, "isColor": false,
+      "paperSize": "A4", "paperType": "plain", "pageRange": "1-5", "pageSet": "even-reverse",
+      "wantErr": "ErrUnsupportedCombination"
+    }
+  ]
+}

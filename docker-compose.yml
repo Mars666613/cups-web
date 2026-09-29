@@ -1,0 +1,105 @@
+services:
+  # 单容器（AIO）形态：cupsd 与 cups-web 跑在同一个容器里，
+  # entrypoint.sh 后台拉起 cupsd（带 watchdog），前台 exec /cups-web 作为 PID 1。
+  cups:
+    image: hanxi/cups-web:latest
+    container_name: cups
+    # 必须 root：容器内要跑 cupsd、lpadmin、dpkg（驱动安装），
+    # 还要往 /usr/lib/cups、/usr/share/ppd 等系统路径写驱动文件。
+    #
+    # ⚠️ 还有一条容易忽略的理由：**USB 打印机能不能用取决于这一行**。
+    # CUPS 把 usb backend 归为 RBACKENDS 并装成 0744，cupsd 据此（检测到
+    # 无 group/other 写执行位、且自身 uid 为 0）以 **root** 运行它。
+    # 一旦改成非 root（k8s runAsUser、docker run -u），cupsd 的 RunUser != 0
+    # 会让 backend 降权运行，此时宿主 udev 给 USB 打印机设的 root:lp 0660
+    # 与容器内 lp 的 gid 是否一致就变成决定性因素——不一致就会表现为
+    # 队列永久停在 "Waiting for printer to become available"。
+    user: root
+    # avahi 以 CUPS.local 在局域网广播 AirPrint / IPP Everywhere 服务（issue #107）。
+    hostname: CUPS
+    # host 网络模式（issue #107）：mDNS/DNS-SD 依赖局域网组播（5353/udp），
+    # 桥接模式下组播报文出不去也进不来，容器内 avahi 既发现不了局域网里的
+    # 网络打印机（dnssd://…._ipp._tcp.local），手机也搜不到 AirPrint 广播。
+    # 代价：无法自定义端口映射，CUPS 固定占用宿主 631，Web 端口由下方
+    # LISTEN_ADDR 决定（默认 :1180）；宿主若自装 avahi-daemon 会与容器内
+    # avahi 抢 5353 端口，且宿主 avahi 无法替容器内 CUPS 广播/发现
+    # （两条独立 D-Bus 总线），部署本项目应停掉宿主侧 avahi。
+    network_mode: host
+    # 解除 AppArmor 限制（issue #91）：
+    # 防止在 PVE (Proxmox VE) LXC 或部分 Linux 系统中出现
+    # apparmor="DENIED" operation="create" comm="jobs.cgi" family="unix" 导致打印失败。
+    # 合并成单容器后它同时也保护 LibreOffice / OFD 转换子进程不被 AppArmor 拦截
+    # （原来这两条注释分别写在 cups 与 web 两个服务上）。
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - CUPSADMIN=${CUPSADMIN:-print}
+      - CUPSPASSWORD=${CUPSPASSWORD:-print}
+      - TZ=${TZ:-Asia/Shanghai}
+      # host 网络下没有端口映射可言，用 LISTEN_ADDR 让 Web 直接监听 1180，
+      # 与旧桥接时代的宿主端口保持一致，老用户的书签 / 反向代理配置不用改。
+      - LISTEN_ADDR=${LISTEN_ADDR:-:1180}
+
+      # ── 支付宝（可选）──────────────────────────────────────────────
+      # 四项齐全时支付宝才会出现在支付方式里；缺任何一项则该渠道不展示
+      # （不会出现「点了必然失败」的按钮）。
+      #
+      # ⚠️ ALIPAY_PUBLIC_KEY 是【支付宝公钥】，不是应用公钥。两个都是从开放
+      #    平台复制的一行 base64，传错的话所有验签都失败，而报错只有
+      #    「验签失败」四个字。
+      # ⚠️ 私钥放环境变量而不是管理端设置：它会跟着 data/*.db 一起进备份。
+      # ⚠️ 内网部署没有公网回调地址时不用管 notify_url —— 到账由
+      #    order_worker 的主动查单发现（每 30 秒一批），用户也可以点「我已支付」。
+      # 沙箱联调把 ALIPAY_GATEWAY 指到
+      #   https://openapi-sandbox.dl.alipaydev.com/gateway.do
+      # - ALIPAY_APP_ID=2021000000000000
+      # - ALIPAY_PRIVATE_KEY=用引号包住的应用私钥（一行 base64）
+      # - ALIPAY_PUBLIC_KEY=用引号包住的支付宝公钥（一行 base64）
+      # - ALIPAY_GATEWAY=https://openapi.alipay.com/gateway.do
+    # ⚠️ 不要挂载宿主的 /run/dbus/system_bus_socket（issue #107）：
+    # 旧版为借用宿主 avahi 广播 AirPrint（issue #94）挂了这个 socket，
+    # 但宿主没装 avahi-daemon 时反而害了容器——socket 路径被宿主文件占用，
+    # entrypoint 里容器自己的 dbus-daemon 起不来，avahi 跟着失效，
+    # CUPS 既发现不了网络打印机也解析不了 dnssd:// URI。
+    # host 网络模式下容器内自启的 dbus + avahi（见 entrypoint.sh）已经
+    # 能直接在局域网发现和广播，无需依赖宿主任何服务。
+    #
+    # USB 打印机热插拔支持（issue #81）：
+    # 不能用 devices:——它是容器启动时的一次性设备绑定，打印机「后开机」时
+    # 宿主机 udev 新建的 /dev/bus/usb/<bus>/<dev> 节点不会传播进容器，导致
+    # CUPS 枚举不到，必须重启容器。改为 bind-mount 整个 /dev/bus/usb 目录
+    # （目录挂载实时反映新建节点），配合 device_cgroup_rules 放开 USB 字符
+    # 设备（major 189）的 cgroup 权限，让 CUPS 的 usb backend 在运行时能
+    # 枚举到后接入的打印机。/run/udev 只读挂载让 libusb 读到设备属性，
+    # 改善识别（宿主机无 /run/udev 时该挂载可删除）。
+    volumes:
+      - ./.etc:/etc/cups
+      - ./.data:/data
+      - ./.uploads:/uploads
+      # 驱动持久化快照目录：driver-install 把每个手动安装驱动的产物文件
+      # （PPD / filter / backend / firmware / 闭源 .so）按 manifest.txt 拷进
+      # /opt/cups-drivers/data/<driver>/，容器重启时 entrypoint 的
+      # restore-drivers 再逐文件恢复回系统路径。
+      # ⚠️ 删掉这个目录（或不挂这个卷）= 丢失所有手动安装的第三方驱动，
+      # 重启后需要在 Web「驱动」页面重新安装一遍。
+      - ./.drivers:/opt/cups-drivers/data
+      - /dev/bus/usb:/dev/bus/usb
+      - /run/udev:/run/udev:ro
+    device_cgroup_rules:
+      - 'c 189:* rmw'
+    # ── 特权模式：USB 打印机发现（issue #110） ────────────────────────────
+    # 上面 device_cgroup_rules + /dev/bus/usb 挂载在 x86 平台通常足够让
+    # libusb 枚举 USB 打印机，但在部分 ARM / 嵌入式平台（Amlogic S905L、
+    # 树莓派、各类 TV Box 跑 Armbian 等）上，非特权容器中 /sys 是过滤视图，
+    # libusb 拿不到 sysfs 里的设备列表 → lpinfo -v 返回空 → CUPS 不知道
+    # 打印机存在，打印任务报 "Unable to open the initial device"。
+    #
+    # privileged: true 卸掉所有 cgroup 限制，让 libusb 能完整访问 sysfs，
+    # 在所有平台上可靠工作。代价是安全隔离减弱，但本项目本身就以 root 运行
+    # cupsd + dpkg + 驱动安装脚本，安全边界本来就不在容器层，而在"谁有
+    # admin 密码"——管理员密码 = 容器 root 权限（见 README 驱动上传安全说明）。
+    #
+    # 如果你非常确定自己的平台靠 device_cgroup_rules 就够用（绝大多数 x86），
+    # 可以注释掉这行来收紧一层；如果 USB 打印机 lpinfo -v 看不到，请启用它。
+    privileged: true
+    restart: unless-stopped

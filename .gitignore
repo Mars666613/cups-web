@@ -1,0 +1,46 @@
+.etc/
+.data
+.uploads
+.drivers
+
+bin/
+frontend/dist/
+node_modules/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Claude Code 本地配置。
+#
+# ⚠️ 这里必须忽略：settings.local.json 会把「被批准的 Bash 命令」原样存进
+# 权限白名单，而联调时的命令行上常带密钥 —— 实测支付宝私钥就是这么进去的。
+# 全局 gitignore 也挡了一份，但那条不随仓库走，换台机器克隆再提交就会漏。
+.claude/
+
+# Environment
+.env
+.env.local
+
+# Logs and coverage
+.cache/
+coverage/
+*.log
+
+# Build outputs
+data/
+uploads/
+/server
+# 调试器（GoLand / VSCode）生成的二进制，60MB 级，且与平台绑定。
+__debug_bin*
+
+# Go
+vendor/
+
+# Maven
+ofd-converter/target/
+
+.aone_copilot/
+
+

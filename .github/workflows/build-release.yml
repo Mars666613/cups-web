@@ -1,0 +1,148 @@
+name: Build and Release Binaries
+
+on:
+  push:
+    branches:
+      - '*'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+            suffix: linux-armv7
+          - goos: linux
+            goarch: loong64
+            suffix: linux-loong64
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          # 固定到 1.26.1：1.26.2+ 在 runtime.osinit 中加入了严格的 kernel
+          # 版本解析（getKernelVersion / parseRelease），在部分 HiSilicon 等
+          # 嵌入式设备上 uname 返回的 release 字段会触发
+          # `fatal error: failed to parse kernel version from uname`
+          # 启动崩溃。详见 issue #49。
+          go-version: '1.26.1'
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          bun install
+          bunx vite build
+
+      - name: Resolve version
+        id: ver
+        # tag 推送时 github.ref_name 就是 tag 名（vX.Y.Z），分支推送时是分支名。
+        # 再用 git describe 兜底，保证 workflow_dispatch 手动触发时也能拿到一个合理的版本字符串。
+        run: |
+          VERSION="${{ github.ref_name }}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "master" ] || [ "$VERSION" = "main" ]; then
+            VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Using VERSION=$VERSION"
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+          # 强制使用上一步 setup-go 安装的本地工具链，防止 Go 因 go.mod 的
+          # 兼容性策略自动下载更高版本而再次引入 #49 的崩溃。
+          GOTOOLCHAIN: local
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          go build -ldflags="-s -w -X main.Version=${VERSION}" -o cups-web-${{ matrix.suffix }} ./cmd/server
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cups-web-${{ matrix.suffix }}
+          path: cups-web-${{ matrix.suffix }}
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: build
+    # 只在 v* tag 或 master 分支 push 时创建 Release；其他分支照常编译
+    # 但不创建——否则每个分支名都会变成一个同名 git 标签（尤其 master 会
+    # 与分支引用重名，git push 报 "src refspec master matches more than one"）。
+    if: ${{ github.event_name == 'push' && (github.ref_type == 'tag' || github.ref == 'refs/heads/master') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Delete existing release if exists
+        run: |
+          RELEASE_TAG="${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}"
+          echo "Checking if release exists for tag: $RELEASE_TAG"
+          RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG" | \
+            jq -r '.id // empty')
+          if [ -n "$RELEASE_ID" ] && [ "$RELEASE_ID" != "null" ]; then
+            echo "Found existing release with ID: $RELEASE_ID, deleting..."
+            curl -s -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID"
+            echo "Release deleted"
+          else
+            echo "No existing release found for tag: $RELEASE_TAG"
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # v* tag 推送时用 tag 名（vX.Y.Z）；master 分支推送统一用 dev，
+          # 避免把分支名当成 git 标签名（与分支引用重名冲突）。
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+          name: Release ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+          files: artifacts/*
+          draft: false
+          prerelease: ${{ github.ref_type == 'branch' }}
+          generate_release_notes: ${{ github.ref_type == 'tag' }}
+          body: ${{ github.ref_type == 'branch' && 'This is a pre-release build from branch **' || '' }}${{ github.ref_type == 'branch' && github.ref_name || '' }}${{ github.ref_type == 'branch' && '**.' || '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
