@@ -365,21 +365,21 @@ func reprintHandler(w http.ResponseWriter, r *http.Request) {
 		outPath, cleanup, err := convertOfficeToPDF(countCtx, storedAbs)
 		if err != nil {
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "conversion failed")
+			writeJSONError(w, http.StatusBadRequest, convertErrMsg(err))
 			return
 		}
 		pages, err = countPDFPages(outPath)
 		if err != nil {
 			cleanup()
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "failed to read pages")
+			writeJSONError(w, http.StatusBadRequest, countPagesErrMsg(err))
 			return
 		}
 		_, convertedAbs, err := saveConvertedPDFToUploads(outPath, storedRel, uploadDir)
 		if err != nil {
 			cleanup()
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusInternalServerError, "failed to save converted file")
+			writeJSONError(w, http.StatusInternalServerError, saveErrMsg(err))
 			return
 		}
 		printPath = convertedAbs
@@ -389,21 +389,21 @@ func reprintHandler(w http.ResponseWriter, r *http.Request) {
 		outPath, cleanup, err := convertOFDToPDF(countCtx, storedAbs)
 		if err != nil {
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "conversion failed")
+			writeJSONError(w, http.StatusBadRequest, convertErrMsg(err))
 			return
 		}
 		pages, err = countPDFPages(outPath)
 		if err != nil {
 			cleanup()
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "failed to read pages")
+			writeJSONError(w, http.StatusBadRequest, countPagesErrMsg(err))
 			return
 		}
 		_, convertedAbs, err := saveConvertedPDFToUploads(outPath, storedRel, uploadDir)
 		if err != nil {
 			cleanup()
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusInternalServerError, "failed to save converted file")
+			writeJSONError(w, http.StatusInternalServerError, saveErrMsg(err))
 			return
 		}
 		printPath = convertedAbs
@@ -413,14 +413,14 @@ func reprintHandler(w http.ResponseWriter, r *http.Request) {
 		outPath, cleanup, err := convertImageToPDF(storedAbs, req.Orientation, req.PaperSize, false)
 		if err != nil {
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "conversion failed")
+			writeJSONError(w, http.StatusBadRequest, convertErrMsg(err))
 			return
 		}
 		_, convertedAbs, err := saveConvertedPDFToUploads(outPath, storedRel, uploadDir)
 		if err != nil {
 			cleanup()
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusInternalServerError, "failed to save converted file")
+			writeJSONError(w, http.StatusInternalServerError, saveErrMsg(err))
 			return
 		}
 		printPath = convertedAbs
@@ -431,20 +431,20 @@ func reprintHandler(w http.ResponseWriter, r *http.Request) {
 		pages, err = estimateTextPages(storedAbs)
 		if err != nil {
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "failed to read pages")
+			writeJSONError(w, http.StatusBadRequest, countPagesErrMsg(err))
 			return
 		}
 		outPath, cleanup, err := convertTextToPDF(storedAbs, req.Orientation, req.PaperSize)
 		if err != nil {
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "conversion failed")
+			writeJSONError(w, http.StatusBadRequest, convertErrMsg(err))
 			return
 		}
 		_, convertedAbs, err := saveConvertedPDFToUploads(outPath, storedRel, uploadDir)
 		if err != nil {
 			cleanup()
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusInternalServerError, "failed to save converted file")
+			writeJSONError(w, http.StatusInternalServerError, saveErrMsg(err))
 			return
 		}
 		printPath = convertedAbs
@@ -454,7 +454,7 @@ func reprintHandler(w http.ResponseWriter, r *http.Request) {
 		pages, _, err = countPages(countCtx, storedAbs, record.Filename)
 		if err != nil {
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "failed to read pages")
+			writeJSONError(w, http.StatusBadRequest, countPagesErrMsg(err))
 			return
 		}
 	}
@@ -589,9 +589,13 @@ func reprintHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = appStore.WithTx(r.Context(), false, func(tx *sql.Tx) error {
+	// 回写失败只记日志：纸已经出来了，不把重打判成失败；
+	// 但记录会停在 queued，事后得能从日志查到（见 print_handlers.go 的同款说明）。
+	if err := appStore.WithTx(r.Context(), false, func(tx *sql.Tx) error {
 		return store.UpdatePrintStatus(r.Context(), tx, recordID, "printed", job)
-	})
+	}); err != nil {
+		log.Printf("[reprint] 回写打印记录状态失败（记录会停在 queued）: record=%d err=%v", recordID, err)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(printResp{

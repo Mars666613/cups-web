@@ -41,6 +41,22 @@ export async function readError(resp) {
   }
 }
 
+// ── 会话失效的全局兜底 ────────────────────────────────────────────
+//
+// ⚠️ 原先只在每个调用点各传各的 `() => emit('logout')`，实测漏了一大片：
+// 支付链路上 9 处调用全都没传（PaymentModal 全程一处都没有），
+// 症状是会话过期后点「确认支付」反复失败、弹一句英文 Unauthorized，
+// 而应用不会登出 —— 用户卡在原地，也看不出是登录过期。
+//
+// 逐个补是治标的：新写的调用点照样会忘。所以加一个全局默认，
+// 第三个参数仍可覆盖（目前只有 PaymentModal 的轮询刻意覆盖过，见那里的说明）。
+let unauthorizedHandler = null
+
+// setUnauthorizedHandler 注册会话失效时的默认处理（由 App.vue 在启动时调用）。
+export function setUnauthorizedHandler(fn) {
+  unauthorizedHandler = fn
+}
+
 // 封装 fetch，自动附加 credentials 和 CSRF token，统一处理 401
 // onUnauthorized 是一个回调函数，由调用方传入（用于触发登出）
 export async function apiFetch(url, options = {}, onUnauthorized = null) {
@@ -66,9 +82,10 @@ export async function apiFetch(url, options = {}, onUnauthorized = null) {
 
   const resp = await fetch(url, opts)
 
-  // 检查 401 状态，调用 onUnauthorized 回调
-  if (resp.status === 401 && onUnauthorized) {
-    onUnauthorized()
+  // 401：优先用调用点传的处理，没传就走全局兜底。
+  if (resp.status === 401) {
+    if (onUnauthorized) onUnauthorized()
+    else if (unauthorizedHandler) unauthorizedHandler()
   }
 
   return resp

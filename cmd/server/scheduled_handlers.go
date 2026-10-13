@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -159,7 +160,7 @@ func scheduledCreateHandler(w http.ResponseWriter, r *http.Request) {
 	baseDir := scheduledBaseDir(uploadDir, sess.UserID)
 	storedRel, _, err := saveUploadedFile(file, fh.Filename, baseDir)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "failed to save file")
+		writeJSONError(w, http.StatusInternalServerError, saveErrMsg(err))
 		return
 	}
 	relInUploads := filepath.ToSlash(filepath.Join(scheduledSubDir, strconv.FormatInt(sess.UserID, 10), storedRel))
@@ -362,10 +363,14 @@ func scheduledRunNowHandler(w http.ResponseWriter, r *http.Request) {
 	if execErr != nil {
 		errMsg = execErr.Error()
 	}
-	_ = appStore.WithTx(r.Context(), false, func(tx *sql.Tx) error {
+	// 回写失败只记日志：任务确实跑过了，不因此改变它的状态；
+	// 但 last_error 没落库的话，用户下次打开列表看不到失败原因，只能靠日志。
+	if err := appStore.WithTx(r.Context(), false, func(tx *sql.Tx) error {
 		return store.UpdateScheduledPrintAfterRun(r.Context(), tx, id,
 			time.Now().UTC().Format(time.RFC3339), status, errMsg, task.NextRunAt, task.Enabled)
-	})
+	}); err != nil {
+		log.Printf("[scheduled] 回写任务执行结果失败（列表里看不到本次原因）: task=%d err=%v", id, err)
+	}
 	if execErr != nil {
 		writeJSONError(w, http.StatusInternalServerError, execErr.Error())
 		return

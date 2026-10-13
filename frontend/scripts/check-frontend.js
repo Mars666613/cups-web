@@ -10,6 +10,7 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { resolve, dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { parse, compileScript, compileTemplate } from 'vue/compiler-sfc'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const srcDir = resolve(scriptDir, '../src')
@@ -110,6 +111,120 @@ for (const file of walk(srcDir)) {
           `      改成 @xxx="${name}()"，或把可选行为拆成独立函数。`
       )
     }
+  }
+}
+
+// ── 检查 3：顶层 watch 的源不能引用后面才声明的 ref ──
+//
+// `watch([a, b, c], cb)` 和 `watch(ref, cb)` 的【源参数是立即求值的】。
+// 源里的标识符若声明在下面几百行，setup 会踩暂时性死区：
+//
+//     Cannot access 'quickText' before initialization
+//
+// 而 setup 抛异常 = 整个页面白屏。构建、类型、本文件其它检查全是绿的 ——
+// 只有浏览器控制台能看到。实测踩过：一条 saveSession 的 watch 放在文件
+// 前段，源数组里却引用了中部才声明的 quickText，手机上一打开就是白屏。
+//
+// ⚠️ 只能查【直接引用】。间接的（顶层调用一个 hoisted 函数、函数体里再
+// 引用后面的 ref）静态看不出来 —— 那种一律放到 setup 末尾。
+for (const file of walk(srcDir)) {
+  if (!file.endsWith('.vue')) continue
+  const text = readFileSync(file, 'utf8')
+  const s = text.indexOf('<script setup>')
+  if (s < 0) continue
+  const lines = text.slice(s + 14).split('\n')
+  const baseLine = text.slice(0, s).split('\n').length // <script setup> 的绝对行号
+
+  // 顶层声明 → 行号
+  const decl = new Map()
+  lines.forEach((l, i) => {
+    const m = l.match(/^(?:const|let|var)\s+([A-Za-z_$][\w$]*)/)
+    if (m) decl.set(m[1], baseLine + i)
+  })
+
+  lines.forEach((l, i) => {
+    if (!/^watch\(/.test(l)) return // 只认第 0 列的顶层 watch
+    const abs = baseLine + i
+    const head = l.slice(l.indexOf('(') + 1)
+    // 取第一个参数：配平括号，遇到顶层逗号即止
+    let depth = 0
+    let arg = ''
+    for (const ch of head) {
+      if ('([{'.includes(ch)) depth++
+      else if (')]}'.includes(ch)) {
+        if (depth === 0) break
+        depth--
+      } else if (ch === ',' && depth === 0) break
+      arg += ch
+    }
+    // 源里的裸标识符（数组形式逐个取，单 ref 形式就一个）
+    const names = arg
+      .replace(/[[\]]/g, ' ')
+      .split(',')
+      .map(x => x.trim())
+      .filter(x => /^[A-Za-z_$][\w$]*$/.test(x))
+    for (const n of names) {
+      const d = decl.get(n)
+      if (d !== undefined && d > abs) {
+        failures.push(
+          `${relative(process.cwd(), file)}:${abs}\n` +
+            `      watch(${arg.trim()}, …)\n` +
+            `      源参数是【立即求值】的，但 ${n} 声明在第 ${d} 行 —— 会踩暂时性死区。\n` +
+            `      setup 抛异常 = 整页白屏，而构建与其它检查都是绿的。\n` +
+            `      把这条 watch 移到 ${n} 声明之后（通常就是 setup 末尾）。`
+        )
+      }
+    }
+  })
+}
+
+// ── 检查 4：模板里引用的名字必须在 <script setup> 里有定义 ──
+//
+// Vite 构建【完全不检查模板】：模板里写一个拼错的名字、或拆文件时漏搬一个
+// ref，构建照过、其它检查也照过，只有进浏览器才报
+//   "Property "xxx" was accessed during render but is not defined on instance"
+// 而且只炸那一个页面。实测就是拆 AdminView 时最容易漏的东西。
+//
+// 判据直接来自 Vue 编译器本身，不是正则猜的：<script setup> 下能解析到的
+// 标识符会编成 `$setup.x`，解析不到的才落到 `_ctx.x`。所以扫编译产物里的
+// `_ctx.` 就是精确的「这个模板引用了脚本里没有的东西」。
+const VUE_INSTANCE_PROPS = new Set([
+  // Vue 的实例属性由运行时挂在实例代理上（$emit 声明了 emits、$slots 是插槽），
+  // 模板里合法，但编译器同样把它们编成 _ctx.$xxx —— 必须显式放过。
+  '$attrs', '$emit', '$slots', '$props', '$refs', '$el', '$options', '$parent',
+  '$root', '$data', '$route', '$router', '$forceUpdate', '$nextTick', '$watch'
+])
+
+for (const file of walk(srcDir)) {
+  if (!file.endsWith('.vue')) continue
+  const { descriptor, errors } = parse(readFileSync(file, 'utf8'), { filename: file })
+  // 解析不过的文件交给构建去报，不在这里抢；没有模板或没有 <script setup> 的跳过。
+  if (errors.length || !descriptor.template || !descriptor.scriptSetup) continue
+
+  let bindings
+  try {
+    bindings = compileScript(descriptor, { id: 'check' }).bindings
+  } catch {
+    continue
+  }
+  const { code } = compileTemplate({
+    source: descriptor.template.content,
+    filename: file,
+    id: 'check',
+    compilerOptions: { bindingMetadata: bindings }
+  })
+
+  const missing = new Set()
+  for (const m of code.matchAll(/_ctx\.([A-Za-z_$][\w$]*)/g)) {
+    if (!VUE_INSTANCE_PROPS.has(m[1])) missing.add(m[1])
+  }
+  if (missing.size) {
+    failures.push(
+      `${relative(process.cwd(), file)}\n` +
+        `      模板引用了 <script setup> 里没有的名字：${[...missing].join(', ')}\n` +
+        `      Vite 构建不检查模板，这类错误只在浏览器里炸，且只炸这一个页面。\n` +
+        `      拆文件时漏搬 ref、或名字拼错，都是这个症状。`
+    )
   }
 }
 

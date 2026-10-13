@@ -1,5 +1,6 @@
 import './polyfills/uint8-base64.js'
 import './polyfills/promise-with-resolvers.js'
+import './polyfills/map-get-or-insert.js'
 import { createApp } from 'vue'
 import { addCollection } from '@iconify/vue'
 import lucideIcons from '@iconify-json/lucide/icons.json'

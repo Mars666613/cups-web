@@ -50,34 +50,11 @@ func startPrintForOrder(ctx context.Context, orderID int64) (string, error) {
 	}
 
 	// os.OpenInRoot 自带目录逃逸防护（Go 1.24+），与项目其它读上传文件的地方一致。
-	f, err := os.OpenInRoot(uploadDir, filepath.FromSlash(order.PrintPath))
+	f, mime, err := openOrderPrintFile(order)
 	if err != nil {
 		return "failed", failOrderAndRefund(ctx, orderID, "待打印文件缺失")
 	}
 	defer f.Close()
-
-	mime := order.PrintMime
-	if mime == "" {
-		mime = detectOrderMime(f)
-	}
-
-	opts := ipp.PrintJobOptions{
-		IsDuplex:     order.IsDuplex,
-		IsColor:      order.IsColor,
-		Copies:       order.Copies,
-		Orientation:  order.Orientation,
-		PaperSize:    order.PaperSize,
-		PaperType:    order.PaperType,
-		PrintScaling: order.PrintScaling,
-		MediaSource:  order.MediaSource,
-		PageRange:    order.PageRange,
-		PageSet:      order.PageSet,
-		Mirror:       order.Mirror,
-
-		NumberUp:       order.NumberUp,
-		NumberUpLayout: order.NumberUpLayout,
-		PageBorder:     order.PageBorder,
-	}
 
 	// ── 提交前确认打印机可用 ──
 	//
@@ -93,7 +70,7 @@ func startPrintForOrder(ctx context.Context, orderID int64) (string, error) {
 		return "failed", failOrderAndRefund(ctx, orderID, "打印机当前不可用："+reason)
 	}
 
-	job, err := ipp.SendPrintJob(order.PrinterURI, f, mime, order.Username, order.Filename, opts)
+	job, err := ipp.SendPrintJob(order.PrinterURI, f, mime, order.Username, order.Filename, buildPrintJobOptions(order))
 	if err != nil {
 		log.Printf("[order] #%d 送印失败: %v", orderID, err)
 		return "failed", failOrderAndRefund(ctx, orderID, "打印失败："+err.Error())
@@ -124,6 +101,50 @@ func startPrintForOrder(ctx context.Context, orderID int64) (string, error) {
 
 	log.Printf("[order] #%d 已提交到 CUPS（job=%s），等待打印完成确认", orderID, job)
 	return "printing", nil
+}
+
+// ─── 两条送印路径共用的零件 ─────────────────────────────────────────
+//
+// 送印有两条路：计费的 startPrintForOrder（支付后送），和刷卡取件的
+// startPullPrintForOrder（刷卡后送）。它们送的【是同一份参数快照】，
+// 拼 IPP 与读文件这两段必须共用 —— 各写一份的表现是「某种模式下
+// 某个参数被悄悄丢了」，而且只有拿真打印机才看得出来。
+
+// buildPrintJobOptions 从订单的参数快照拼出 IPP 请求选项。
+func buildPrintJobOptions(order store.PrintOrder) ipp.PrintJobOptions {
+	return ipp.PrintJobOptions{
+		IsDuplex:     order.IsDuplex,
+		IsColor:      order.IsColor,
+		Copies:       order.Copies,
+		Orientation:  order.Orientation,
+		PaperSize:    order.PaperSize,
+		PaperType:    order.PaperType,
+		PrintScaling: order.PrintScaling,
+		MediaSource:  order.MediaSource,
+		PageRange:    order.PageRange,
+		PageSet:      order.PageSet,
+		Mirror:       order.Mirror,
+
+		NumberUp:       order.NumberUp,
+		NumberUpLayout: order.NumberUpLayout,
+		PageBorder:     order.PageBorder,
+	}
+}
+
+// openOrderPrintFile 打开订单的待打印文件并判定它的 mime。
+//
+// mime 优先用订单里存的；存空时才现探一次。调用方负责 Close。
+func openOrderPrintFile(order store.PrintOrder) (*os.File, string, error) {
+	// os.OpenInRoot 自带目录逃逸防护（Go 1.24+），与项目其它读上传文件的地方一致。
+	f, err := os.OpenInRoot(uploadDir, filepath.FromSlash(order.PrintPath))
+	if err != nil {
+		return nil, "", err
+	}
+	mime := order.PrintMime
+	if mime == "" {
+		mime = detectOrderMime(f)
+	}
+	return f, mime, nil
 }
 
 // printerUnavailableReason 返回打印机不可用的原因；可用时返回空串。
@@ -290,6 +311,106 @@ func failOrderAndRefund(ctx context.Context, orderID int64, reason string) error
 	return nil
 }
 
+// ─── 刷卡取件的送印 ───────────────────────────────────────────────────
+
+// startPullPrintForOrder 把一条【已被领取】（status=printing）的持件订单送到
+// CUPS。它是 startPrintForOrder 在刷卡取件模式下的孪生兄弟，读文件与拼 IPP
+// 完全共用，区别只有一处 —— 但那一处是致命的：
+//
+//	失败时【退回 held】，绝不走 failOrderAndRefund。
+//
+// 员工没付钱，任务不该丢。退回 held 可以重刷、可以等打印机恢复、到期还有
+// TTL 兜底，失败语义完全可逆。而 failOrderAndRefund 会先把订单标成 failed
+// （不管金额是不是 0 —— 它在退款之前那一步就已经改了状态），员工就得重新
+// 上传一遍。
+//
+// 调用方（kiosk_handlers.go）负责先原子领取（store.ClaimHeldOrdersForPrinter）。
+// 这里拿到的是已经处于 printing 的订单，所以【不】再 claim 一次。
+//
+// 返回的 error 非空表示这次没送成，且【订单状态已经处理完毕】，
+// 错误文本就是给终端/日志看的原因。
+func startPullPrintForOrder(ctx context.Context, order store.PrintOrder) error {
+	// 打印机可用性：领取之前 kiosk handler 已经查过一次，这里是第二次。
+	// 两次都要有 —— 领取到送印之间打印机完全可能掉线（同 startPrintForOrder）。
+	if reason := printerUnavailableReason(order.PrinterURI); reason != "" {
+		log.Printf("[pull] #%d 打印机不可用，不提交：%s", order.ID, reason)
+		return revertPullOrder(ctx, order.ID, "打印机当前不可用："+reason)
+	}
+
+	f, mime, err := openOrderPrintFile(order)
+	if err != nil {
+		// ⚠️ 文件缺失【不】退回 held：重刷多少次都一样，那是个死循环。
+		// 标失败，让员工在记录页看到明确的原因。
+		log.Printf("[pull] #%d 待打印文件缺失: %v", order.ID, err)
+		return failPullOrder(ctx, order.ID, "待打印文件缺失")
+	}
+	defer f.Close()
+
+	job, err := ipp.SendPrintJob(order.PrinterURI, f, mime, order.Username, order.Filename, buildPrintJobOptions(order))
+	if err != nil {
+		log.Printf("[pull] #%d 送印失败: %v", order.ID, err)
+		return revertPullOrder(ctx, order.ID, "打印失败："+err.Error())
+	}
+
+	// 到这一步 CUPS 只是【收下了】任务（IPP 的 Print-Job 是异步的，见
+	// startPrintForOrder 那段长注释）。订单停在 printing，交给现有的核对
+	// 链路（confirmPrintResults → decidePrintAction）去确认真实结果 ——
+	// 与计费路径完全同一套，这里不另起一套。
+	recordID := recordOrderInPrintHistory(ctx, order, job)
+	if err := appStore.WithTx(ctx, false, func(tx *sql.Tx) error {
+		return store.SetOrderSubmitted(ctx, tx, order.ID, job, recordID)
+	}); err != nil {
+		// ⚠️ 这里【不能】退回 held：任务真的进了 CUPS，纸可能已经出来了。
+		// 退回 held 会让下次刷卡再打一份。标失败并留证给人判断。
+		log.Printf("[pull] #%d 已提交到 CUPS 但任务号回写失败（job=%s）: %v", order.ID, job, err)
+		return failPullOrder(ctx, order.ID, "打印任务号记录失败，请确认打印机是否已出纸")
+	}
+
+	log.Printf("[pull] #%d 已提交到 CUPS（job=%s），等待打印完成确认", order.ID, job)
+	return nil
+}
+
+// revertPullOrder 送印失败时把订单退回待取件 —— 员工可以原地重刷。
+//
+// 返回的 error 带上原因，供调用方回报给取件终端（无屏幕时它会进日志）。
+func revertPullOrder(ctx context.Context, orderID int64, reason string) error {
+	var reverted bool
+	if err := appStore.WithTx(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		reverted, err = store.RevertOrderToHeld(ctx, tx, orderID, reason)
+		return err
+	}); err != nil {
+		return fmt.Errorf("退回待取件失败: %w", err)
+	}
+	if !reverted {
+		// 状态已经不是 printing 且 job_id 为空 —— 可能被后台的孤儿扫描
+		// 先一步处理了，或者任务其实已经发出去了。如实记一笔，别静默。
+		log.Printf("[pull] #%d 退回待取件未生效（状态已变），按失败上报", orderID)
+	}
+	return errors.New(reason)
+}
+
+// failPullOrder 把持件订单标成失败，【且不退任何款】。
+//
+// 🚫 走 MarkOrderFailed 而不是 failOrderAndRefund —— 后者带退款语义，
+// 而取件订单金额恒为 0、压根没有钱可退。混进去只会让「这条路会不会动钱」
+// 这件事变得必须读一遍才能确认，而这是资金安全的关键路径。
+func failPullOrder(ctx context.Context, orderID int64, reason string) error {
+	if err := appStore.WithTx(ctx, false, func(tx *sql.Tx) error {
+		ok, err := store.MarkOrderFailed(ctx, tx, orderID, reason, store.OrderStatusPrinting)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			log.Printf("[pull] #%d 标失败未生效（状态已变）", orderID)
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("标记失败出错: %w", err)
+	}
+	return errors.New(reason)
+}
+
 // ─── 余额支付 ─────────────────────────────────────────────────────────
 
 // orderPayHandler 支付一个批次。
@@ -373,7 +494,9 @@ func payOrdersByBalance(w http.ResponseWriter, r *http.Request, sess auth.Sessio
 			return sql.ErrNoRows
 		}
 
-		total, err := store.SumPendingAmountByBatch(ctx, tx, batchID)
+		// 加行锁：下面要按这个合计值扣款，中途不能被别人改动这批订单
+		// （否则会按取消前的总额扣钱）。这条路径在写事务里，加锁合法。
+		total, err := store.SumPendingAmountByBatchLocked(ctx, tx, batchID)
 		if err != nil {
 			return err
 		}

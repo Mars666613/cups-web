@@ -8,4 +8,5 @@
 // 在官方 worker 代码执行前完成方法补齐。
 import './uint8-base64.js'
 import './promise-with-resolvers.js'
+import './map-get-or-insert.js'
 import 'pdfjs-dist/build/pdf.worker.min.mjs'

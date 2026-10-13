@@ -13,12 +13,19 @@
 
 ### 修改数据库结构
 
-1. 在 `internal/store/` 中修改或新增模型
-2. 在 `store.go::migrate()` 中：
+1. 在 `internal/store/schema.sql` 里改表结构（🖊️ 那是**唯一事实来源**，程序启动时 `//go:embed` 整份执行）
    - 新表：追加 `CREATE TABLE IF NOT EXISTS ...`
-   - 旧表加字段：用 `addColumnIfMissing(ctx, db, "<table>", "<column_def>")`
-3. 更新对应的 CRUD 函数
-4. 本地用 `sqlite3 data/cups-web.db` 验证迁移在新库与老库上都能跑通
+   - 旧表加字段：`ALTER TABLE <t> ADD COLUMN IF NOT EXISTS ...`
+   - ⚠️ 每条语句都要能重复执行。**没有版本表**，也不再有 `addColumnIfMissing` 那套增量逻辑
+2. 更新对应的 CRUD 函数（`internal/store/` 下的模型与查询）
+3. 新写法注意方言：占位符是 `$1..$n`（不是 `?`）、自增主键要 `RETURNING id`、布尔列写 `TRUE`/`FALSE`。详见 [AGENTS.md](../AGENTS.md#️-数据库)
+4. 本地验证：
+
+```bash
+createdb cupsweb_test && psql -d cupsweb_test -f internal/store/schema.sql   # 能建出来
+psql -d cupsweb_test -f internal/store/schema.sql                            # 再跑一遍，幂等
+TEST_DATABASE_URL='postgres://localhost/cupsweb_test?sslmode=disable' go test ./...
+```
 
 ### 新增前端页面
 
@@ -77,19 +84,33 @@ go vet ./...                 # 静态检查
 
 ```bash
 cd frontend
+bun run check:frontend       # 静态检查：构建能过、进浏览器才炸的那几类坑
 bun run build                # 构建检查（类型与语法）
 bun run dev                  # 本地调试
 ```
 
+> `check:frontend`（`scripts/check-frontend.js`）补的正是 `vite build` **查不到**的东西 ——
+> Vite 只做语法与模板编译，运行期的约束一概不检。四条检查：
+>
+> 1. `SelectItem` 的 `value` 不能是空字符串（Reka UI 保留给「清空选择」，传进去会打崩整棵组件树）
+> 2. 带默认参数的函数不能被裸绑定到模板事件上（`@click="fn"` 会把 `MouseEvent` 传成第一个实参）
+> 3. 顶层 `watch` 的源不能引用后面才声明的 ref（暂时性死区 = 整页白屏）
+> 4. **模板里引用的名字必须在 `<script setup>` 里有定义** —— 判据是 Vue 编译器本身：
+>    能解析到的编成 `$setup.x`，解析不到的落到 `_ctx.x`，所以扫 `_ctx.` 就是精确的「没定义」。
+>    **拆大文件时漏搬一个 ref 就是这个症状**，而构建、类型、其它检查全绿。
+
 ### 数据库查看
 
 ```bash
-sqlite3 data/cups-web.db
-.tables
+psql "$DATABASE_URL"
+\dt
 SELECT * FROM users;
 SELECT id, filename, status, is_duplex, is_color, created_at FROM print_jobs ORDER BY id DESC LIMIT 20;
 SELECT * FROM settings;
 ```
+
+> 💡 跑测试时要连一个**独立的库**（`TEST_DATABASE_URL`）—— 测试会在里面建随机 schema，
+> 不会碰你的开发数据，但别直接指向生产库。没设这个变量时相关测试会跳过。
 
 ## 代码风格
 

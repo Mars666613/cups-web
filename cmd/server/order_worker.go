@@ -50,7 +50,7 @@ func startOrderWorker(s *store.Store, uploads string) {
 	}()
 }
 
-// orderTick 处理四种「订单卡住了」的情形。
+// orderTick 处理几种「订单卡住了」的情形。
 //
 // 全部操作都是幂等的：状态迁移一律带 WHERE status = ... 条件，
 // 因此与支付回调、用户手动重试并发时也只会有一个生效。
@@ -61,6 +61,10 @@ func orderTick(ctx context.Context, s *store.Store, uploads string) {
 	compensateStalePaidOrders(ctx, s, now)
 	confirmPrintResults(ctx, s, now)
 	expireUnpaidBatches(ctx, s, uploads, now)
+
+	// 刷卡取件的两条：员工作废的任务要清，卡住的任务要救。
+	expireHeldOrders(ctx, s, now)
+	recoverOrphanPullOrders(ctx, s, now)
 }
 
 // ─── 按需查单：把「付完到界面变样」从 30 秒压到几秒 ───────────────────
@@ -357,7 +361,35 @@ const (
 	printActionUnconfirmed
 	// printActionUnknownState 未知状态，只记日志。
 	printActionUnknownState
+
+	// ── 下面两个是【刷卡取件专用】的翻译结果，由 pullReconcileAction 产出 ──
+	//
+	// 计费订单在这儿要退款（钱已经收了）；取件订单一分钱没收，退无可退，
+	// 但同样必须把订单标成失败并留证 —— 不能让它继续挂在 printing。
+	// 之所以翻译成不同的动作而不是改 decidePrintAction：后者是被
+	// order_worker_test.go 逐分支覆盖的纯函数，是全系统唯一决定
+	// 「已付的钱要不要退」的地方，它的语义不该被另一种模式污染。
+	//
+	// printActionPullFailed 确定没打出来：标失败，【不退款】。
+	printActionPullFailed
+	// printActionPullCancelFailed 卡住了：先取消任务，再标失败，【不退款】。
+	printActionPullCancelFailed
 )
+
+// pullReconcileAction 把计费链路的裁决翻译成刷卡取件该做的事。
+//
+// 只翻译「跟钱有关」的那两支；等待/完成/转人工/未知四支原样透传 ——
+// 它们与计费无关，两条链路的行为本来就该一样。
+func pullReconcileAction(a printAction) printAction {
+	switch a {
+	case printActionRefunded:
+		return printActionPullFailed
+	case printActionCancelRefund:
+		return printActionPullCancelFailed
+	default:
+		return a
+	}
+}
 
 // progressTracker 记住每个任务上次观测到的完成印数，用来回答
 // 「这个任务到底有没有在出纸」。
@@ -490,7 +522,13 @@ func reconcilePrintingOrder(ctx context.Context, s *store.Store, o store.PrintOr
 	// 印数停着不动多久了。这是判断「在出纸」还是「在空转重试」的唯一依据。
 	noProgressFor := printProgress.observe(o.JobID, st.Impressions, now)
 
-	switch decidePrintAction(state, found, stuckFor, noProgressFor) {
+	action := decidePrintAction(state, found, stuckFor, noProgressFor)
+	// 刷卡取件【没有钱可退】，但同样需要收尾。翻译成它该做的动作。
+	if o.Source == store.OrderSourcePull {
+		action = pullReconcileAction(action)
+	}
+
+	switch action {
 	case printActionWait:
 		// 什么都不做。绝大多数轮次落在这里。
 		if !found {
@@ -526,6 +564,22 @@ func reconcilePrintingOrder(ctx context.Context, s *store.Store, o store.PrintOr
 
 	case printActionUnconfirmed:
 		markPrintUnconfirmed(ctx, s, o, "打印结果无法确认（CUPS 中已无该任务），请核对后决定是否退款")
+
+	case printActionPullFailed:
+		// 与计费的 printActionRefunded 是同一情形，只是无钱可退。
+		log.Printf("[pull] #%d 任务被取消/中止（state=%d），标记失败（未收费，无需退款）", o.ID, state)
+		markPrintUnconfirmed(ctx, s, o, "打印任务被取消或中止，请重新提交")
+
+	case printActionPullCancelFailed:
+		// 与计费的 printActionCancelRefund 同一情形。取消这一步照样要做：
+		// 任务还挂在队列里的话，打印机恢复后会凭空打出来 —— 而员工以为
+		// 它已经失败了。
+		if cerr := ipp.CancelJob(o.PrinterURI, ipp.JobIDFromURI(o.JobID), o.Username); cerr != nil {
+			log.Printf("[pull] #%d 取消卡住的任务失败（job=%s）: %v", o.ID, o.JobID, cerr)
+			return
+		}
+		log.Printf("[pull] #%d 任务卡在 state=%d 超过 %s，已取消并标记失败（未收费）", o.ID, state, printStuckAfter)
+		markPrintUnconfirmed(ctx, s, o, "打印机长时间无响应，任务已取消，请重新提交")
 
 	default:
 		log.Printf("[order] #%d 未知任务状态 %d（job=%s）", o.ID, state, o.JobID)
@@ -630,6 +684,94 @@ func expireUnpaidBatches(ctx context.Context, s *store.Store, uploads string, no
 		}
 		if len(expired) > 0 {
 			log.Printf("[order] 批次 %s 超时未支付，已释放 %d 笔订单的文件", batchID, len(expired))
+		}
+	}
+}
+
+// ─── 刷卡取件的后台收尾 ───────────────────────────────────────────────
+
+// expireHeldOrders 回收员工一直没来取的任务。
+//
+// 与 expireUnpaidBatches（超时未支付）的区别是语义：那个是「没人付钱」，
+// 这个是「付过了钱」——不，取件模式压根没有钱，是「员工一直没来取」。
+// 共同点都是「正常结局，删文件走人」，所以不需要任何补偿动作。
+//
+// ⚠️ 顺序是「先迁移状态、后删文件」：先删文件的话，如果员工正好在这一刻刷卡，
+// 领到的就是一条文件已经不在的订单 —— 那样 startPullPrintForOrder 会把它
+// 标成失败（文件缺失），而员工其实什么错都没犯。反过来先改状态，
+// 刷卡那边就再也领不到它了（WHERE status='held' 匹配不上）。
+func expireHeldOrders(ctx context.Context, s *store.Store, now time.Time) {
+	var ids []int64
+	if err := s.WithTx(ctx, true, func(tx *sql.Tx) error {
+		var err error
+		ids, err = store.ListExpiredHeldOrders(ctx, tx, now.Format(time.RFC3339), orderTickBatch)
+		return err
+	}); err != nil {
+		log.Printf("[pull] 扫描过期待取件任务失败: %v", err)
+		return
+	}
+
+	for _, id := range ids {
+		var order store.PrintOrder
+		var expired bool
+		if err := s.WithTx(ctx, false, func(tx *sql.Tx) error {
+			var err error
+			expired, err = store.MarkHeldOrdersExpired(ctx, tx, id, "超过取件时限，任务已作废")
+			if err != nil || !expired {
+				return err
+			}
+			order, err = store.GetOrderByID(ctx, tx, id)
+			return err
+		}); err != nil {
+			log.Printf("[pull] #%d 过期处理失败: %v", id, err)
+			continue
+		}
+		if !expired {
+			continue // 刚被领走或已撤销，正常
+		}
+		removeOrderFiles(order)
+		log.Printf("[pull] #%d 超过取件时限未取，已作废并释放文件（%s）", id, order.Filename)
+	}
+}
+
+// recoverOrphanPullOrders 救回「领了但没送出去」的任务。
+//
+// 释放流程是「先原子领取（held→printing），再在事务外送印」。若进程恰好在
+// 这两步之间挂掉（崩溃、被 kill、断电），订单会永远停在 printing 且没有
+// job_id。而核对链路只捞 job_id 非空的订单，这类孤儿【没有任何回收路径】——
+// 表现是「任务卡死：不打、不回退、界面上永远显示打印中」。
+//
+// ⚠️ 只回退 error = PullClaimMarker 的，不是所有「printing 且无 job_id」的：
+// 送印成功但任务号回写失败时形状一样，那种回退会让员工下次刷卡重复出纸。
+// 判据的取舍写在 store.PullClaimMarker 的注释里。
+//
+// 宽限期用 orderStuckPrintingAfter 的一半：太短会把「正在送印、只是慢」
+// 误判成孤儿；太长则员工要干等。正常送印是几百毫秒级的，几分钟足够。
+func recoverOrphanPullOrders(ctx context.Context, s *store.Store, now time.Time) {
+	before := now.Add(-orderStuckPrintingAfter / 2).Format(time.RFC3339)
+
+	var ids []int64
+	if err := s.WithTx(ctx, true, func(tx *sql.Tx) error {
+		var err error
+		ids, err = store.ListOrphanPullOrders(ctx, tx, before, orderTickBatch)
+		return err
+	}); err != nil {
+		log.Printf("[pull] 扫描孤儿取件任务失败: %v", err)
+		return
+	}
+
+	for _, id := range ids {
+		var reverted bool
+		if err := s.WithTx(ctx, false, func(tx *sql.Tx) error {
+			var err error
+			reverted, err = store.RevertOrderToHeld(ctx, tx, id, "")
+			return err
+		}); err != nil {
+			log.Printf("[pull] #%d 孤儿回退失败: %v", id, err)
+			continue
+		}
+		if reverted {
+			log.Printf("[pull] #%d 领取后未能送印（进程中断？），已退回待取件", id)
 		}
 	}
 }

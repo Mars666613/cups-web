@@ -25,9 +25,30 @@ const CurrencyCNY = "CNY"
 // 读库失败时按「已开启」处理，让用户看到「计费已开启，请通过打印订单提交」，
 // 而不是在数据库故障期间免费打印。这里的降级方向直接对应收入损失。
 func billingEnabled(ctx context.Context) bool {
+	return modeFlag(ctx, store.SettingBillingEnabled, "billing")
+}
+
+// pullModeEnabled 读刷卡取件总开关。默认关闭。
+//
+// 与计费【互斥】（互斥在 adminUpdateSettingsHandler 里强制）：两者描述的都是
+// 「这个部署的打印入口是谁」，同时开启会得到两个都不对的入口 ——
+// /api/print 既该 403 又该暂存。
+//
+// 降级方向与计费相同，也是 fail-closed：读库失败时宁可让用户看到一条明确的
+// 拒绝，也不能放行一次「本该暂存却直接打出来」的打印。
+func pullModeEnabled(ctx context.Context) bool {
+	return modeFlag(ctx, store.SettingPullModeEnabled, "pull")
+}
+
+// modeFlag 是模式开关的统一读取。两个开关（计费 / 取件）共用。
+//
+// 降级方向 fail-closed 与 getPrintLimits 的 fail-open 正好相反：
+// 读库失败时按「已开启」处理。理由是这个方向直接对应「打错东西」或
+// 「白送钱」，而另一个方向的代价只是用户多点一次。
+func modeFlag(ctx context.Context, key, tag string) bool {
 	var enabled int64
 	err := appStore.WithTx(ctx, true, func(tx *sql.Tx) error {
-		v, err := store.GetSettingInt(ctx, tx, store.SettingBillingEnabled, 0)
+		v, err := store.GetSettingInt(ctx, tx, key, 0)
 		if err != nil {
 			return err
 		}
@@ -35,7 +56,7 @@ func billingEnabled(ctx context.Context) bool {
 		return nil
 	})
 	if err != nil {
-		log.Printf("[billing] 读取计费开关失败，按已开启处理（fail-closed）: %v", err)
+		log.Printf("[%s] 读取开关 %s 失败，按已开启处理（fail-closed）: %v", tag, key, err)
 		return true
 	}
 	return enabled != 0

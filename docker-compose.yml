@@ -40,6 +40,22 @@ services:
       # 与旧桥接时代的宿主端口保持一致，老用户的书签 / 反向代理配置不用改。
       - LISTEN_ADDR=${LISTEN_ADDR:-:1180}
 
+      # ── 数据库（必填）──────────────────────────────────────────────
+      # 所有店连同一台中心 PostgreSQL。⚠️ 没配这一项容器起不来 ——
+      # 已不再支持 SQLite，没有回退。
+      #
+      # ⚠️ 跨公网连中心库时 sslmode 必须 require 或更高，否则密码与订单
+      #    数据都是明文过网。同机 / 可信内网才用 disable。
+      # ⚠️ 建库时要指定 C collation，理由见 .env.example 与 schema.sql 顶部。
+      #
+      # 值写在同目录的 .env 里（已 gitignore），这里只引用变量名 ——
+      # 🚫 不要把带密码的连接串直接写在这一行：docker-compose.yml 是提交进
+      #    git 的，写了就等于把生产库密码推进版本库。
+      - DATABASE_URL=${DATABASE_URL:-}
+      # 每个实例开多少条连接。所有店加起来不能超过服务端的 max_connections
+      # （PG 默认 100）：20 店 × 10 = 200 会直接连不上。
+      - DB_MAX_CONNS=${DB_MAX_CONNS:-10}
+
       # ── 支付宝（可选）──────────────────────────────────────────────
       # 四项齐全时支付宝才会出现在支付方式里；缺任何一项则该渠道不展示
       # （不会出现「点了必然失败」的按钮）。
@@ -50,12 +66,20 @@ services:
       # ⚠️ 私钥放环境变量而不是管理端设置：它会跟着 data/*.db 一起进备份。
       # ⚠️ 内网部署没有公网回调地址时不用管 notify_url —— 到账由
       #    order_worker 的主动查单发现（每 30 秒一批），用户也可以点「我已支付」。
-      # 沙箱联调把 ALIPAY_GATEWAY 指到
+      # ⚠️ 值写在同目录的 .env 里（它已被 .gitignore 忽略），这里只引用变量名。
+      # 🚫 不要在这里直接写私钥：docker-compose.yml 是【提交进 git 的】，
+      #    写了就等于把生产私钥推进版本库。
+      # 生产环境不要设 ALIPAY_GATEWAY —— 留空时代码默认就用正式网关；
+      # 沙箱联调才需要把它指到
       #   https://openapi-sandbox.dl.alipaydev.com/gateway.do
-      # - ALIPAY_APP_ID=2021000000000000
-      # - ALIPAY_PRIVATE_KEY=用引号包住的应用私钥（一行 base64）
-      # - ALIPAY_PUBLIC_KEY=用引号包住的支付宝公钥（一行 base64）
-      # - ALIPAY_GATEWAY=https://openapi.alipay.com/gateway.do
+      - ALIPAY_APP_ID=${ALIPAY_APP_ID:-}
+      - ALIPAY_PRIVATE_KEY=${ALIPAY_PRIVATE_KEY:-}
+      - ALIPAY_PUBLIC_KEY=${ALIPAY_PUBLIC_KEY:-}
+      # ⚠️ 这一行原先【漏了】——上面 56-58 行写着「沙箱联调把它指过去」，
+      #    但没列进 environment，于是写在 .env 里也进不了容器，沙箱联调会
+      #    静默打到生产网关。启动日志那行 [config] 支付宝 会显示真实网关，
+      #    就是为这类错配准备的。
+      - ALIPAY_GATEWAY=${ALIPAY_GATEWAY:-}
     # ⚠️ 不要挂载宿主的 /run/dbus/system_bus_socket（issue #107）：
     # 旧版为借用宿主 avahi 广播 AirPrint（issue #94）挂了这个 socket，
     # 但宿主没装 avahi-daemon 时反而害了容器——socket 路径被宿主文件占用，
@@ -74,7 +98,10 @@ services:
     # 改善识别（宿主机无 /run/udev 时该挂载可删除）。
     volumes:
       - ./.etc:/etc/cups
-      - ./.data:/data
+      # ⚠️ 原来这里还挂过 `./.data:/data`，装的是 SQLite 库文件。
+      # 数据库搬到中心 PostgreSQL 之后，容器里不再有任何东西会写 /data，
+      # 所以这个卷已删除。宿主机上的 ./.data 目录可以留着不管（里面只有
+      # 旧的 cups-web.db），确认不需要回滚之后再删。
       - ./.uploads:/uploads
       # 驱动持久化快照目录：driver-install 把每个手动安装驱动的产物文件
       # （PPD / filter / backend / firmware / 闭源 .so）按 manifest.txt 拷进

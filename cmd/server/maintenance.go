@@ -68,16 +68,16 @@ func cleanupAllPrints(ctx context.Context, s *store.Store, uploads string) (int,
 	orderRemoved, oerr := cleanupOrderArtifacts(ctx, s, uploads, "")
 	if oerr != nil {
 		log.Printf("[maintenance] 回收终态订单文件失败: %v", oerr)
+	} else if orderRemoved > 0 {
+		log.Printf("[maintenance] 回收了 %d 个终态订单的文件", orderRemoved)
 	}
 
-	if len(paths) > 0 || orderRemoved > 0 {
-		if _, err := s.DB.ExecContext(ctx, "VACUUM"); err != nil {
-			return len(paths), err
-		}
-		if _, err := s.DB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-			return len(paths), err
-		}
-	}
+	// 这里原先跑的是 SQLite 的 VACUUM + PRAGMA wal_checkpoint(TRUNCATE)，
+	// 用来把删掉的空间还给操作系统。
+	//
+	// PostgreSQL 不需要（也不允许在事务里跑 VACUUM）：空间回收由 autovacuum
+	// 后台自动完成，而 WAL 的截断由 checkpoint 机制管理。
+	// 🚫 不要因为「以前这里有一步」就把 VACUUM 搬过来 —— 那只会定期报错。
 	return len(paths), nil
 }
 
@@ -109,7 +109,7 @@ func cleanupOldPrints(ctx context.Context, s *store.Store, uploads string, now t
 
 	var paths []string
 	err = s.WithTx(ctx, false, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, "SELECT stored_path FROM print_jobs WHERE created_at < ?", cutoff)
+		rows, err := tx.QueryContext(ctx, "SELECT stored_path FROM print_jobs WHERE created_at < $1", cutoff)
 		if err != nil {
 			return err
 		}
@@ -125,7 +125,7 @@ func cleanupOldPrints(ctx context.Context, s *store.Store, uploads string, now t
 			return err
 		}
 		rows.Close()
-		_, err = tx.ExecContext(ctx, "DELETE FROM print_jobs WHERE created_at < ?", cutoff)
+		_, err = tx.ExecContext(ctx, "DELETE FROM print_jobs WHERE created_at < $1", cutoff)
 		return err
 	})
 	if err != nil {
@@ -145,14 +145,8 @@ func cleanupOldPrints(ctx context.Context, s *store.Store, uploads string, now t
 		log.Printf("[maintenance] 回收终态订单文件失败: %v", oerr)
 	}
 
-	if len(paths) > 0 {
-		if _, err := s.DB.ExecContext(ctx, "VACUUM"); err != nil {
-			return err
-		}
-		if _, err := s.DB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-			return err
-		}
-	}
+	// 同 cleanupAllPrintHistory：SQLite 的 VACUUM / wal_checkpoint 已随驱动一起
+	// 删除，空间回收交给 PostgreSQL 的 autovacuum。
 	return nil
 }
 

@@ -2,21 +2,24 @@ package payment
 
 // 支付宝渠道。
 //
-// ── 两种收款方式，按设备分流 ──
+// ── 收款方式，按设备分流 ──
 //
 // 这个程序主要给手机用（手机访问部署好的网址 → 传文件 → 打印），但电脑上
-// 也得能用。两种设备拿什么付款完全不同，所以同一个渠道下备了两条路：
+// 也得能用。两种设备拿什么付款不同，所以同一个渠道下备了两条路走：
 //
 //	手机 → alipay.trade.wap.pay（手机网站支付）
-//	       给一个收银台地址，当前浏览器跳过去。收银台会自动唤起支付宝 App，
-//	       付完【支付宝把浏览器送回 return_url】—— 用户不必自己去任务切换器
-//	       里找我们的页面。
+//	电脑 → alipay.trade.page.pay（电脑网站支付）
 //
-//	电脑 → alipay.trade.precreate（当面付）
-//	       给一串 qr_code 渲染成二维码，用手机扫。电脑上不需要任何跳转。
-//	       手机端在拿不到回跳地址时也退回这条（见 createPayment 里的降级）。
+// 两者机制完全一样：给一个收银台地址，当前浏览器跳过去；手机上会自动唤起
+// 支付宝 App，电脑上收银台页面显示二维码可以扫。付完都由【支付宝把浏览器
+// 送回 return_url】—— 用户不必自己去任务切换器里找我们的页面。
 //
-// 两条路共用同一套 out_trade_no、查单、退款、关单 —— 区别只在「怎么把用户
+// 另有一条 alipay.trade.precreate（当面付，二维码直接渲染在我们页面上、不跳转，
+// 体验更连贯），但现在前端不会选它：当面付是【线下收银场景】的产品，网页应用
+// 一般签不下来，官方给网页应用的就是上面两个。保留它是为了将来万一签到了，
+// 前端改一行就能切回来（见 ChannelQRCode 的说明）。
+//
+// 几条路共用同一套 out_trade_no、查单、退款、关单 —— 区别只在「怎么把用户
 // 送到收银台」，钱到账之后的事完全一样。
 //
 // ── 为什么 return_url 用内网地址也行 ──
@@ -54,11 +57,27 @@ const (
 	// https://openapi-sandbox.dl.alipaydev.com/gateway.do
 	AlipayDefaultGateway = "https://openapi.alipay.com/gateway.do"
 
+	// 用户授权（授权登录）的授权页主机【和网关不是同一台】，所以不能从 Gateway
+	// 机械替换出来 —— 必须单独给一个默认值：
+	//   正式  openapi.alipay.com        / openauth.alipay.com
+	//   沙箱  openapi-sandbox.dl...     / openauth.alipaydev.com
+	// 配错的代价是「用户浏览器里出现一个支付宝错误页，而我们这边毫无信号」，
+	// 与 cashierURL 那类问题同源，所以这里要显式、可覆盖。
+	AlipayDefaultAuthorizeURL = "https://openauth.alipay.com/oauth2/publicAppAuthorize.htm"
+	AlipaySandboxAuthorizeURL = "https://openauth.alipaydev.com/oauth2/publicAppAuthorize.htm"
+
+	// alipayAuthScopeBase 是【静默授权】：用户看不到确认页，登录成功后直接跳回
+	// 回调地址。代价是拿不到昵称/头像（那要用 auth_user 再调 alipay.user.info.share）。
+	// 打印场景只需要一个稳定身份标识，所以用 auth_base 换最好的体验。
+	alipayAuthScopeBase = "auth_base"
+
 	alipaySignType = "RSA2" // RSA2 = SHA256withRSA，支付宝只推荐这个
 
-	// alipayWapProductCode 是手机网站支付（alipay.trade.wap.pay）的固定
-	// product_code，传错会被网关直接拒掉。
-	alipayWapProductCode = "QUICK_WAP_WAY"
+	// 两个「页面跳转类」产品的固定 product_code，传错会被网关直接拒掉。
+	//   alipay.trade.wap.pay  → QUICK_WAP_WAY        手机网站支付
+	//   alipay.trade.page.pay → FAST_INSTANT_TRADE_PAY 电脑网站支付
+	alipayWapProductCode  = "QUICK_WAP_WAY"
+	alipayPageProductCode = "FAST_INSTANT_TRADE_PAY"
 
 	// alipayResponseLimit 限制网关响应体大小。响应很小（几 KB），
 	// 设个上限免得对端异常时把内存吃满。
@@ -77,13 +96,17 @@ type AlipayConfig struct {
 	PrivateKey string // 应用私钥（PKCS8/PKCS1、PEM 或裸 base64 均可）
 	PublicKey  string // 支付宝公钥（⚠️ 不是应用公钥）
 	Gateway    string // 留空用正式网关
-	HTTPClient *http.Client
+	// AuthorizeURL 是授权页地址（OAuth 登录用）。留空按 Gateway 是否沙箱推断，
+	// 推断规则见 NewAlipay。只有非常规部署才需要显式指定。
+	AuthorizeURL string
+	HTTPClient   *http.Client
 }
 
 // Alipay 实现 Provider。
 type Alipay struct {
 	appID   string
 	gateway string
+	authURL string
 	priv    *rsa.PrivateKey
 	pub     *rsa.PublicKey
 	http    *http.Client
@@ -110,6 +133,10 @@ func NewAlipay(cfg AlipayConfig) (*Alipay, error) {
 	if gateway == "" {
 		gateway = AlipayDefaultGateway
 	}
+	authURL := strings.TrimSpace(cfg.AuthorizeURL)
+	if authURL == "" {
+		authURL = AuthorizeURLFor(gateway)
+	}
 	client := cfg.HTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: alipayHTTPTimeout}
@@ -117,10 +144,32 @@ func NewAlipay(cfg AlipayConfig) (*Alipay, error) {
 	return &Alipay{
 		appID:   strings.TrimSpace(cfg.AppID),
 		gateway: gateway,
+		authURL: authURL,
 		priv:    priv,
 		pub:     pub,
 		http:    client,
 	}, nil
+}
+
+// AuthorizeURLFor 由网关地址推断对应的授权页地址。
+//
+// 授权页主机与网关不同，但属于【同一套环境】：
+//
+//	正式  openapi.alipay.com      → openauth.alipay.com
+//	沙箱  openapi-sandbox.dl...   → openauth.alipaydev.com
+//
+// 这条规则只有一份 —— NewAlipay 与启动日志（alipayConfigSummary）都调它，
+// 免得日志里报出来的和实际用的不是同一个。
+//
+// ⚠️ 这是"认字符串"的判断：沙箱的两个已知网关主机是 openapi.alipaydev.com 与
+// openapi-sandbox.dl.alipaydev.com，共同特征是 sandbox / alipaydev。支付宝哪天
+// 改了沙箱域名这里就会失准，所以 AlipayConfig.AuthorizeURL 留了显式覆盖的口子。
+func AuthorizeURLFor(gateway string) string {
+	g := strings.ToLower(gateway)
+	if strings.Contains(g, "sandbox") || strings.Contains(g, "alipaydev") {
+		return AlipaySandboxAuthorizeURL
+	}
+	return AlipayDefaultAuthorizeURL
 }
 
 func (a *Alipay) Name() string { return "alipay" }
@@ -143,10 +192,14 @@ func (a *Alipay) Create(ctx context.Context, req Request) (Credential, error) {
 		biz["timeout_express"] = alipayTimeoutExpress(time.Until(req.ExpiresAt))
 	}
 
-	if req.WantsWap() {
+	switch req.Channel {
+	case ChannelWap:
 		return a.createWap(biz, req)
+	case ChannelPage:
+		return a.createPage(biz, req)
+	default:
+		return a.createQRCode(ctx, biz, req)
 	}
-	return a.createQRCode(ctx, biz, req)
 }
 
 // createWap 走手机网站支付：给一个收银台地址，当前浏览器跳过去。
@@ -168,7 +221,7 @@ func (a *Alipay) createWap(biz map[string]string, req Request) (Credential, erro
 	// 与 return_url 同址 —— 付完回来、放弃也回来，两种情况都该回到我们这儿。
 	biz["quit_url"] = req.ReturnURL
 
-	payURL, err := a.wapPayURL(biz, req)
+	payURL, err := a.cashierURL("alipay.trade.wap.pay", biz, req)
 	if err != nil {
 		return Credential{}, err
 	}
@@ -233,19 +286,21 @@ func (a *Alipay) createQRCode(ctx context.Context, biz map[string]string, req Re
 	}, nil
 }
 
-// wapPayURL 组装手机网站支付的收银台地址。
+// cashierURL 组装「页面跳转类」接口的收银台地址。
+//
+// 手机网站支付（wap.pay）与电脑网站支付（page.pay）机制完全一样 ——
+// 商户把签名好的参数交给浏览器，由浏览器跳过去，支付宝渲染收银台；付完再由
+// 支付宝把浏览器送回 return_url。区别只有 method 名与 product_code，
+// 所以共用这一个拼装函数。
 //
 // ⚠️ 与文件里其它调用【根本不同】：这里不发任何 HTTP 请求。
+// 官方 SDK 的 pageExecute 也是这么做的（在本地拼一个自动提交的 form）。
 //
-// 手机网站支付是「页面跳转类」接口 —— 商户把签名好的参数交给浏览器，
-// 由浏览器跳过去，支付宝才渲染收银台。官方 SDK 的 pageExecute 也是这么做的
-// （在本地拼一个自动提交的 form）。
-//
-// 代价必须说清楚：**这一步不会报错**。签名写错、应用没签「手机网站支付」、
-// app_id 不对 —— 全都不会在这里暴露，它们只会在用户的手机上变成一个支付宝
-// 错误页，而我们这边一切正常。所以沙箱联调必须真机完整走一遍，
-// 不能看到接口返回 200 就以为通了。
-func (a *Alipay) wapPayURL(biz map[string]string, req Request) (string, error) {
+// 代价必须说清楚：**这一步不会报错**。签名写错、应用没签这个产品、app_id
+// 不对 —— 全都不会在这里暴露，它们只会在用户浏览器里变成一个支付宝错误页，
+// 而我们这边一切正常。所以联调必须真机完整走一遍，不能看到接口返回 200
+// 就以为通了。
+func (a *Alipay) cashierURL(method string, biz map[string]string, req Request) (string, error) {
 	bizJSON, err := json.Marshal(biz)
 	if err != nil {
 		return "", fmt.Errorf("序列化业务参数失败: %w", err)
@@ -253,7 +308,7 @@ func (a *Alipay) wapPayURL(biz map[string]string, req Request) (string, error) {
 
 	params := url.Values{}
 	params.Set("app_id", a.appID)
-	params.Set("method", "alipay.trade.wap.pay")
+	params.Set("method", method)
 	params.Set("format", "JSON")
 	params.Set("charset", "utf-8")
 	params.Set("sign_type", alipaySignType)
@@ -273,6 +328,35 @@ func (a *Alipay) wapPayURL(biz map[string]string, req Request) (string, error) {
 	params.Set("sign", sign)
 
 	return a.gateway + "?" + params.Encode(), nil
+}
+
+// createPage 走电脑网站支付（page.pay）：电脑端的正路。
+//
+// 用户跳到支付宝的收银台页面，那里会显示二维码（也支持在电脑上登录支付），
+// 用手机扫完由支付宝把浏览器送回 return_url。
+//
+// 早先电脑端用的是当面付的 alipay.trade.precreate（二维码直接渲染在我们页面上，
+// 体验更连贯），但当面付是【线下收银场景】的产品，网页应用通常签不下来 ——
+// 官方为网页应用提供的就是电脑网站支付。见 ChannelPage 的说明。
+func (a *Alipay) createPage(biz map[string]string, req Request) (Credential, error) {
+	if req.ReturnURL == "" {
+		// 与手机端同理：没有回跳地址，用户付完会停在支付宝自己的结果页上，
+		// 还得自己找回我们的页面。宁可显式报错，让上层降级成别的方式。
+		return Credential{}, fmt.Errorf("%w: 电脑网站支付必须提供 return_url", ErrUnavailable)
+	}
+	biz["product_code"] = alipayPageProductCode
+
+	payURL, err := a.cashierURL("alipay.trade.page.pay", biz, req)
+	if err != nil {
+		return Credential{}, err
+	}
+	return Credential{
+		OutTradeNo: req.OutTradeNo,
+		// QRCodeText 空 = 前端据此知道「该跳转，不是该显示二维码」。
+		PayURL:    payURL,
+		ExpiresAt: req.ExpiresAt,
+		Raw:       payURL,
+	}, nil
 }
 
 // Query 调 alipay.trade.query 主动查单。
@@ -499,12 +583,35 @@ func (a *Alipay) CallbackAck() (int, []byte) {
 // ─── 内部 ────────────────────────────────────────────────────────────
 
 // call 组装公共参数、签名并 POST 到网关，返回原始响应体。
+//
+// 业务参数走 biz_content（绝大多数接口的形态）。少数老式接口不吃这一套，
+// 见 callFlat。
 func (a *Alipay) call(ctx context.Context, method string, biz interface{}, notifyURL string) ([]byte, error) {
 	bizJSON, err := json.Marshal(biz)
 	if err != nil {
 		return nil, fmt.Errorf("序列化业务参数失败: %w", err)
 	}
+	return a.postGateway(ctx, method, url.Values{"biz_content": {string(bizJSON)}}, notifyURL)
+}
 
+// callFlat 与 call 的唯一区别：业务参数【直接作为顶级表单项】发出去，不套 biz_content。
+//
+// ⚠️ alipay.system.oauth.token（授权登录换令牌）就是这种老式形态 —— 官方文档给的
+// 调用示例里，grant_type / code 是 `-F` 表单项，压根没有 biz_content：
+//
+//	curl '.../gateway.do?method=alipay.system.oauth.token&...' \
+//	  -F 'grant_type=authorization_code' -F 'code=xxx'
+//
+// 按 call() 发（塞进 biz_content）网关在顶级找不到 grant_type，回
+// `isv.isv.grant-type-invalid`（40002 Invalid Arguments）—— 这条错误信息只说
+// "grant_type 参数不正确"，完全不会提示"参数位置放错了"，实测卡过。
+// 🚫 别改回 call()。
+func (a *Alipay) callFlat(ctx context.Context, method string, biz url.Values, notifyURL string) ([]byte, error) {
+	return a.postGateway(ctx, method, biz, notifyURL)
+}
+
+// postGateway 是所有网关调用的公共骨架：公共参数 + 额外参数 → 签名 → POST。
+func (a *Alipay) postGateway(ctx context.Context, method string, extra url.Values, notifyURL string) ([]byte, error) {
 	params := url.Values{}
 	params.Set("app_id", a.appID)
 	params.Set("method", method)
@@ -513,7 +620,11 @@ func (a *Alipay) call(ctx context.Context, method string, biz interface{}, notif
 	params.Set("sign_type", alipaySignType)
 	params.Set("timestamp", alipayTimestamp())
 	params.Set("version", "1.0")
-	params.Set("biz_content", string(bizJSON))
+	for k, vs := range extra {
+		for _, v := range vs {
+			params.Add(k, v)
+		}
+	}
 	if notifyURL != "" {
 		params.Set("notify_url", notifyURL)
 	}

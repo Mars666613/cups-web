@@ -1,0 +1,34 @@
+[Unit]
+Description=CUPS Web 刷卡取件终端（读卡器 → 服务器）
+# ⚠️ systemd 的注释只能在行首，不能写在配置项后面 —— 写成
+# `Documentation=xxx  # 说明` 会把整行当成 URL，然后报一个看不懂的解析错误。
+# 要连服务器，所以等网络起来。network-online 而不是 network：
+# 后者只保证网卡被配置，此时 DNS/路由可能还没就绪。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cups-kiosk -config /etc/cups-kiosk.conf
+
+# 无论怎么退出都拉起来。这一台是无人值守的打印机终端，
+# 停了不会有人发现 —— 而「不会有人发现」正是要 Restart=always 的理由。
+Restart=always
+RestartSec=5
+
+# ⚠️ 这个单元两种终端程序都能跑（都是 /usr/local/bin/cups-kiosk +
+# -config，两种实现都认这个参数）。用 root 是为了兼容最麻烦的那种：
+#   ① cmd/kiosk（键盘模拟读卡器）：读 /dev/input/event* 要 input 组
+#   ② 它还要写 /sys/class/gpio/export 驱动蜂鸣器，默认只有 root 能写
+#
+# 📌 用 kiosk.py（PC/SC 读卡器）的话【不需要 root】—— 它是通过 pcscd 的
+#    socket 访问读卡器的。可以改成普通用户，或者干脆用用户级的
+#    systemd --user 服务。这里保持 root 只是为了让一个单元通吃两种。
+User=root
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cups-kiosk
+
+[Install]
+WantedBy=multi-user.target

@@ -1,29 +1,20 @@
 <template>
   <UCard>
+    <!-- ⚠️ 这里【不再折叠】。
+         早先它是打印页右栏里的一块，手机上默认收起（要点一下才展开）是合理的。
+         现在它整个页面就是打印记录（个人中心 → 打印记录），再把页面主体收起来
+         就荒唐了：点进来看到的是一个标题，还要再点一次才看到内容。 -->
     <template #header>
-      <div class="flex items-center justify-between cursor-pointer select-none" @click="listExpanded = !listExpanded">
+      <div class="flex items-center justify-between">
         <div class="flex items-center gap-2 font-semibold">
           <UIcon name="i-lucide-history" class="w-5 h-5" />
           打印记录
-          <!-- 折叠时显示最近一条摘要 -->
-          <span v-if="!listExpanded && records.length > 0" class="text-xs font-normal text-muted truncate max-w-48">
-            — {{ records[0].filename }} · {{ formatTime(records[0].createdAt) }} · {{ statusText(records[0].status) }}
-          </span>
         </div>
-        <div class="flex items-center gap-1">
-          <UButton variant="ghost" size="xs" icon="i-lucide-refresh-cw" @click.stop="$emit('refresh')" />
-          <UIcon
-            :name="listExpanded ? 'i-lucide-chevron-down' : 'i-lucide-chevron-right'"
-            class="w-4 h-4 text-muted transition-transform duration-200"
-          />
-        </div>
+        <UButton variant="ghost" size="xs" icon="i-lucide-refresh-cw" @click="$emit('refresh')" />
       </div>
     </template>
-    <div
-      class="transition-all duration-300 ease-in-out overflow-hidden"
-      :style="{ maxHeight: listExpanded ? '24rem' : '0px', visibility: listExpanded ? 'visible' : 'hidden' }"
-    >
-      <div class="space-y-2 max-h-96 overflow-y-auto">
+    <div>
+      <div class="space-y-2 max-h-[60vh] overflow-y-auto">
         <div v-if="loading" class="text-center py-4">
           <UIcon name="i-lucide-loader-circle" class="w-5 h-5 animate-spin mx-auto text-muted" />
         </div>
@@ -137,9 +128,8 @@ const props = defineProps({
   mediaSourceSupported: { type: Array, default: () => [] }
 })
 
-const emit = defineEmits(['refresh', 'reprint'])
+const emit = defineEmits(['refresh', 'reprint', 'reprint-open'])
 
-const listExpanded = ref(window.innerWidth >= 1024)
 const expandedRecords = ref(new Set())
 
 const showReprintModal = ref(false)
@@ -223,6 +213,13 @@ function openReprintDialog(rec) {
     numberUpLayout: rec.numberUpLayout ?? def.numberUpLayout,
     pageBorder: rec.pageBorder ?? def.pageBorder
   }
+  // 告诉父组件这次要往哪台打印机重打。
+  //
+  // 进纸盒可选项（mediaSourceSupported）只能现查：记录页没有「当前打印机」
+  // 这个概念（记录可能来自任意一台），而打印页要传的是它当下选中的那台。
+  // 两边需求不同，所以由父组件拿着 uri 自己去取，组件不替它猜。
+  emit('reprint-open', reprintForm.value.printer)
+
   showReprintModal.value = true
 }
 

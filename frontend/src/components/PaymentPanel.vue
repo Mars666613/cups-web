@@ -42,25 +42,43 @@
           color="primary"
           size="lg"
           block
-          icon="i-lucide-smartphone"
           @click="goToCashier"
-        >去支付宝付款 {{ formatCents(cred.amountCents) }}</UButton>
+        >
+          <template #leading>
+            <PayIcon :provider="provider" class="w-5 h-5" />
+          </template>
+          去{{ providerName }}付款 {{ formatCents(cred.amountCents) }}
+        </UButton>
         <div class="text-xs text-muted text-center">
-          点击后在本页打开支付宝收银台，付完会自动回到这里
+          点击后在本页打开{{ providerName }}收银台，付完会自动回到这里
         </div>
       </template>
 
       <!-- 当面付二维码：电脑上主操作是扫码；手机上是收银台走不通时的退路，
            用 URL Scheme 直接唤起 App（手机扫不了自己屏幕上的码）。 -->
       <template v-else>
+        <!-- ⚠️ 这个按钮走的是支付宝专属的 URL Scheme（见 openAlipayApp 里
+             拼的 alipays://…），照搬到别的渠道会静默失败 —— 点了什么都不
+             会发生，用户只会以为程序坏了。
+
+             ⚠️ 但**别把「换成微信的 scheme」当成加微信支付时的唯一出路**：
+             这个按钮存不存在，取决于最终选哪种收款产品。
+               · 若走 Native（页面内渲染二维码、用户扫码）→ 手机上根本
+                 没有「唤起 App」这个动作，该讨论的是这个按钮是否还留着；
+               · 只有走 H5 / JSAPI（跳转或拉起）时，才轮到「换 scheme」。
+             先定产品，再定这个按钮。详见 docs/wechat-pay.md。 -->
         <UButton
           v-if="isMobile && canOpenApp"
           color="primary"
           size="lg"
           block
-          icon="i-lucide-smartphone"
           @click="openAlipayApp"
-        >去支付宝付款 {{ formatCents(cred.amountCents) }}</UButton>
+        >
+          <template #leading>
+            <PayIcon :provider="provider" class="w-5 h-5" />
+          </template>
+          去{{ providerName }}付款 {{ formatCents(cred.amountCents) }}
+        </UButton>
 
         <QrCode v-if="showQrCode" :value="cred.qrCodeText" :alt="qrAlt">
           <div class="text-xs text-muted">
@@ -119,11 +137,19 @@
 import { ref, computed, watch, onUnmounted } from 'vue'
 import { formatCents } from '../utils/format'
 import { isMobileDevice } from '../utils/device'
+import { payProviderName } from '../utils/payProvider'
 import QrCode from './QrCode.vue'
+import PayIcon from './PayIcon.vue'
 
 const props = defineProps({
   // 渠道凭据：{ outTradeNo, qrCodeText, amountCents, expiresAt, mock }
   cred: { type: Object, default: null },
+  // 渠道标识（alipay / wechat / mock）。
+  //
+  // ⚠️ 凭据里【没有】这个字段，必须由父组件传进来 —— 父组件才是唯一知道
+  // 用户点了哪个渠道的地方。少了它，按钮文案只能写死「去支付宝付款」，
+  // 图标也只能写死，加微信支付时这个组件就整个是错的。
+  provider: { type: String, default: '' },
   // 是否有请求在飞（禁用按钮、显示 loading）
   busy: { type: Boolean, default: false },
   // 是否正在刷新二维码（父组件在持有这个状态，避免重复触发）
@@ -153,6 +179,10 @@ const isWap = computed(() => !props.cred?.qrCodeText && Boolean(props.cred?.payU
 
 const isMobile = isMobileDevice()
 
+// 文案里的品牌名（「去支付宝付款」）。取不到时兜底成「渠道」而不是空串 ——
+// 「去 付款」这种缺主语的句子，是父组件忘了传 provider 的症状，别让它上线。
+const providerName = computed(() => payProviderName(props.provider) || '渠道')
+
 // 二维码这条路上才有「用 Scheme 唤起 App」这个动作可做 ——
 // scheme 喂进去的正是 qr_code。
 const canOpenApp = computed(() => Boolean(props.cred?.qrCodeText && props.cred?.payUrl))
@@ -162,10 +192,10 @@ const canOpenApp = computed(() => Boolean(props.cred?.qrCodeText && props.cred?.
 // 也不对（电脑上未必装了支付宝）。
 const tipText = computed(() => {
   if (props.cred?.mock) return '当前是本地模拟渠道，点下面的按钮即可模拟渠道回调到账。'
-  if (isWap.value) return '点下面的按钮在支付宝完成付款，付完会自动回到本页面。'
+  if (isWap.value) return `点下面的按钮在${providerName.value}完成付款，付完会自动回到本页面。`
   return isMobile
-    ? '点下面的按钮直接打开支付宝付款，付完切回本页面即可，到账会自动开始打印。'
-    : '用支付宝扫码完成支付，到账后会自动开始打印，无需其他操作。'
+    ? `点下面的按钮直接打开${providerName.value}付款，付完切回本页面即可，到账会自动开始打印。`
+    : `用${providerName.value}扫码完成支付，到账后会自动开始打印，无需其他操作。`
 })
 
 // goToCashier 跳到支付宝收银台（手机网站支付）。
@@ -278,6 +308,15 @@ watch(
   () => [expired.value, props.cred?.outTradeNo, props.refreshing, props.busy],
   () => {
     if (!props.cred || props.cred.mock) return
+    // ⚠️ 手机网站支付【绝不换单】。
+    //
+    // 用户此时已经离开我们的页面、在支付宝的收银台上付款。这边一"刷新"就会
+    // 新建一笔支付单，并把旧单在渠道侧 close 掉（服务端
+    // closePreviousBatchPayment）—— 他正在付的那笔交易当场失效，收银台报
+    // 「操作已超时，请重新发起」。
+    //
+    // 这条路上本来也没有二维码可换；有效期跟订单走（15 分钟），不需要刷新。
+    if (isWap.value) return
     if (props.refreshing || props.busy) return
     if (props.error) return // 已经失败了，等用户手动点
     if (!expired.value) return

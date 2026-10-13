@@ -272,7 +272,24 @@ func paymentSyncHandler(w http.ResponseWriter, r *http.Request) {
 	// 把 purpose 一并带出去：手机网站支付付完，支付宝会把浏览器送回
 	// return_url，前端是【重新加载】的，内存里什么都不知道了，只能靠这个
 	// 判断该说「充值成功」还是「正在打印」。
-	writeJSON(w, map[string]interface{}{"paid": true, "purpose": purpose})
+	resp := map[string]interface{}{"paid": true, "purpose": purpose}
+
+	// 再带上批次号，给前端当锚点。
+	//
+	// 付完款回跳后要展示「刚才那一笔打的是什么」，而页面已经重新加载过、
+	// 内存里没有批次号了。没有它就只能去猜「最近一条订单 / 最近一条打印
+	// 记录」—— 多设备或短时间内打印多次时必然猜错，用户会看到别人的单子。
+	if len(orderIDs) > 0 {
+		_ = appStore.WithTx(r.Context(), true, func(tx *sql.Tx) error {
+			o, err := store.GetOrderByID(r.Context(), tx, orderIDs[0])
+			if err != nil {
+				return err
+			}
+			resp["batchId"] = o.BatchID
+			return nil
+		})
+	}
+	writeJSON(w, resp)
 	launchPrintForOrders(orderIDs)
 }
 
@@ -459,14 +476,24 @@ func createPayment(ctx context.Context, in paymentCreateInput) (map[string]inter
 		closePreviousBatchPayment(ctx, in.attachBatchID)
 	}
 
-	// ⚠️ 二维码有效期与【订单】有效期是两回事：
-	//   订单 TTL（order_ttl_minutes，默认 15 分钟）决定用户能在这个页面上待多久
-	//   二维码 TTL（3 分钟）决定眼前这个码能扫多久，到期由前端自动换一张
-	// 所以取两者中较短的那个：二维码不该活得比订单还长。
-	qrTTL := paymentQRTTL
-	if orderTTLValue := orderTTL(ctx); orderTTLValue < qrTTL {
-		qrTTL = orderTTLValue
+	// 设备形态决定收款方式，【先定下来】—— 下面算有效期要用它。
+	//
+	// ⚠️ 手机网站支付必须有 return_url：没有它，用户付完会停在支付宝自己的
+	// 结果页上，还得自己找回我们的页面 —— 那正是改用官方方案要解决的问题。
+	// 拿不到就降级成二维码，而不是发一个用户回不来的链接出去。
+	channel := in.Channel
+	if channel == "" {
+		channel = payment.ChannelQRCode
 	}
+	// ⚠️ 下面这个降级判断只认支付宝的产品词汇，且【不知道渠道的存在】。
+	// 新增渠道前先确认它是否适用：比如某种收款方式根本没有「回跳」这个概念
+	// （页面内二维码就是），那这条判断套上去就是错的。同理见 credTTLFor。
+	if channel == payment.ChannelWap && in.ReturnURL == "" {
+		log.Printf("[payment] 拿不到回跳地址，手机网站支付降级为二维码")
+		channel = payment.ChannelQRCode
+	}
+
+	credTTL := credTTLFor(channel, orderTTL(ctx))
 
 	// 前缀区分用途，对账时肉眼就能分类。
 	prefix := "CW"
@@ -474,7 +501,7 @@ func createPayment(ctx context.Context, in paymentCreateInput) (map[string]inter
 		prefix = "TP"
 	}
 	outTradeNo := newOutTradeNo(prefix)
-	expiresAt := time.Now().UTC().Add(qrTTL).Format(time.RFC3339)
+	expiresAt := time.Now().UTC().Add(credTTL).Format(time.RFC3339)
 
 	var paymentID int64
 	err = appStore.WithTx(ctx, false, func(tx *sql.Tx) error {
@@ -509,23 +536,8 @@ func createPayment(ctx context.Context, in paymentCreateInput) (map[string]inter
 	channelCtx, cancel := context.WithTimeout(context.Background(), paymentChannelTimeout)
 	defer cancel()
 
-	// 设备形态决定收款方式。
-	//
-	// ⚠️ 手机网站支付【必须有】return_url：没有它，用户付完会停在支付宝自己的
-	// 结果页上，还得自己找回我们的页面 —— 那正是改用官方方案要解决的问题本身。
-	// 而回跳地址在「没配 site_base_url 且从请求也推不出主机名」时确实拿不到。
-	//
-	// 所以拿不到就【降级成二维码】，而不是发一个用户回不来的链接出去。
-	// 前端不必特殊处理：看返回里有没有 qrCodeText 就知道走的是哪条路。
-	channel := in.Channel
-	if channel == "" {
-		channel = payment.ChannelQRCode
-	}
-	if channel == payment.ChannelWap && in.ReturnURL == "" {
-		log.Printf("[payment] 拿不到回跳地址，手机网站支付降级为二维码")
-		channel = payment.ChannelQRCode
-	}
-
+	// channel 在函数上半段就定好了（算有效期要用它），这里直接用。
+	// 前端不必特殊处理降级：看返回里有没有 qrCodeText 就知道走的是哪条路。
 	cred, err := provider.Create(channelCtx, payment.Request{
 		OutTradeNo:  outTradeNo,
 		AmountCents: in.AmountCents,
@@ -533,7 +545,7 @@ func createPayment(ctx context.Context, in paymentCreateInput) (map[string]inter
 		UserID:      in.UserID,
 		NotifyURL:   paymentNotifyURL(ctx, in.Method),
 		ReturnURL:   in.ReturnURL,
-		ExpiresAt:   time.Now().UTC().Add(qrTTL),
+		ExpiresAt:   time.Now().UTC().Add(credTTL),
 		Channel:     channel,
 	})
 	if err != nil {
@@ -561,6 +573,36 @@ func createPayment(ctx context.Context, in paymentCreateInput) (map[string]inter
 		// 真实渠道下为 false，前端不渲染那个按钮。
 		"mock": in.Method == store.PaymentProviderMock,
 	}, nil
+}
+
+// credTTLFor 算一笔支付凭据的有效期。这个值最终会变成发给支付宝的
+// timeout_express（见 payment.Request.ExpiresAt），直接决定用户在收银台上
+// 有多少时间把钱付掉。
+//
+// ⚠️ 必须【按渠道分开算】，不能共用一个值 —— 两条路的"用户在哪里"完全不同：
+//
+//	二维码：用户【还在我们页面上】，盯着这个码。到期由前端自动换一张，
+//	        所以短一点（3 分钟）反而好：避免他对着一个失效的码反复扫。
+//	收银台：用户【已经离开我们的页面】去了支付宝。这条路没有"自动刷新"
+//	        可言；而 3 分钟对收银台太短 —— 首次付款要登录、可能要输密码，
+//	        很容易超。超了这笔交易就被渠道关闭，收银台报
+//	        「操作已超时，请重新发起」。实测踩过。
+func credTTLFor(channel string, orderTTLValue time.Duration) time.Duration {
+	// 两条【收银台】路（手机网站支付 / 电脑网站支付）都跟订单走。
+	// 注意也不能活得比订单长：否则会出现「还能付，但订单已经过期回收了」的错位。
+	//
+	// ⚠️ 这里同样只认支付宝的 channel 词汇，且不知道调用方是哪个渠道。
+	// 新增渠道前先确认：这个渠道的收款方式里，哪些属于「用户已经离开我们的
+	// 页面」（要跟订单走），哪些属于「码在我们页面上、能自动刷新」（3 分钟）。
+	// 分错的后果实测过 —— 3 分钟对收银台太短，渠道会报「操作已超时，请重新发起」。
+	// 同理见上面 createPayment 里那处 wap 降级。
+	if channel == payment.ChannelWap || channel == payment.ChannelPage {
+		return orderTTLValue
+	}
+	if orderTTLValue < paymentQRTTL {
+		return orderTTLValue
+	}
+	return paymentQRTTL
 }
 
 // paymentNotifyURL 拼渠道的异步通知地址。

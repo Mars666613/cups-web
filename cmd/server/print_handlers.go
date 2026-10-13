@@ -46,6 +46,15 @@ func printHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 刷卡取件模式下这个入口同样关闭 —— 任务必须先暂存、刷卡才出纸。
+	// 少了这道判断，一次 curl 就能把文件直接打出来，完全绕开取件流程：
+	// 纸在员工不在场的时候出来了，而「刷卡才出纸」正是这个模式存在的理由。
+	// （前端此时本来就走 /api/pull-orders，这道判断是防直连的兜底。）
+	if pullModeEnabled(r.Context()) {
+		writeJSONError(w, http.StatusForbidden, "刷卡取件已开启，请通过打印订单提交")
+		return
+	}
+
 	maxPages, _ := getPrintLimits(r.Context())
 	applyUploadLimit(w, r)
 	// Expect multipart form
@@ -134,7 +143,7 @@ func printHandler(w http.ResponseWriter, r *http.Request) {
 
 	storedRel, storedAbs, err := saveUploadedFile(file, fh.Filename, uploadDir)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "failed to save file")
+		writeJSONError(w, http.StatusInternalServerError, saveErrMsg(err))
 		return
 	}
 
@@ -173,14 +182,14 @@ func printHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			cleanup()
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "failed to read pages")
+			writeJSONError(w, http.StatusBadRequest, countPagesErrMsg(err))
 			return
 		}
 		_, convertedAbs, err := saveConvertedPDFToUploads(outPath, storedRel, uploadDir)
 		if err != nil {
 			cleanup()
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusInternalServerError, "failed to save converted file")
+			writeJSONError(w, http.StatusInternalServerError, saveErrMsg(err))
 			return
 		}
 		printPath = convertedAbs
@@ -197,14 +206,14 @@ func printHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			cleanup()
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "failed to read pages")
+			writeJSONError(w, http.StatusBadRequest, countPagesErrMsg(err))
 			return
 		}
 		_, convertedAbs, err := saveConvertedPDFToUploads(outPath, storedRel, uploadDir)
 		if err != nil {
 			cleanup()
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusInternalServerError, "failed to save converted file")
+			writeJSONError(w, http.StatusInternalServerError, saveErrMsg(err))
 			return
 		}
 		printPath = convertedAbs
@@ -214,14 +223,14 @@ func printHandler(w http.ResponseWriter, r *http.Request) {
 		outPath, cleanup, err := convertImageToPDF(storedAbs, orientation, paperSize, invert)
 		if err != nil {
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "conversion failed")
+			writeJSONError(w, http.StatusBadRequest, convertErrMsg(err))
 			return
 		}
 		_, convertedAbs, err := saveConvertedPDFToUploads(outPath, storedRel, uploadDir)
 		if err != nil {
 			cleanup()
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusInternalServerError, "failed to save converted file")
+			writeJSONError(w, http.StatusInternalServerError, saveErrMsg(err))
 			return
 		}
 		printPath = convertedAbs
@@ -233,20 +242,20 @@ func printHandler(w http.ResponseWriter, r *http.Request) {
 		pages, err = estimateTextPages(storedAbs)
 		if err != nil {
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "failed to read pages")
+			writeJSONError(w, http.StatusBadRequest, countPagesErrMsg(err))
 			return
 		}
 		outPath, cleanup, err := convertTextToPDF(storedAbs, orientation, paperSize)
 		if err != nil {
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "conversion failed")
+			writeJSONError(w, http.StatusBadRequest, convertErrMsg(err))
 			return
 		}
 		_, convertedAbs, err := saveConvertedPDFToUploads(outPath, storedRel, uploadDir)
 		if err != nil {
 			cleanup()
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusInternalServerError, "failed to save converted file")
+			writeJSONError(w, http.StatusInternalServerError, saveErrMsg(err))
 			return
 		}
 		printPath = convertedAbs
@@ -257,7 +266,7 @@ func printHandler(w http.ResponseWriter, r *http.Request) {
 		pages, _, err = countPages(countCtx, storedAbs, fh.Filename)
 		if err != nil {
 			_ = os.Remove(storedAbs)
-			writeJSONError(w, http.StatusBadRequest, "failed to read pages")
+			writeJSONError(w, http.StatusBadRequest, countPagesErrMsg(err))
 			return
 		}
 	}
@@ -415,9 +424,16 @@ func printHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if saveHistory && recordID > 0 {
-		_ = appStore.WithTx(r.Context(), false, func(tx *sql.Tx) error {
+		// ⚠️ 回写失败必须留痕。
+		//
+		// 纸已经出来了，所以不把这次打印判成失败；但记录会永久停在 queued，
+		// 用户在「打印记录」里看到的是「排队中」—— 他会以为没打出去而重复点
+		// 重打。这里不出错响应，但日志里得有，否则事后完全查不到。
+		if err := appStore.WithTx(r.Context(), false, func(tx *sql.Tx) error {
 			return store.UpdatePrintStatus(r.Context(), tx, recordID, "printed", job)
-		})
+		}); err != nil {
+			log.Printf("[print] 回写打印记录状态失败（记录会停在 queued）: record=%d err=%v", recordID, err)
+		}
 	}
 	if !saveHistory {
 		_ = os.Remove(storedAbs)

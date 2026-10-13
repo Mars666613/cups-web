@@ -226,7 +226,9 @@ func prepareOrderPrint(ctx context.Context, form orderForm, file io.Reader, file
 	default:
 		p, _, err := countPages(countCtx, storedAbs, filename)
 		if err != nil {
-			return fail(badRequestErr("failed to read pages"))
+			// 与 /api/estimate、/api/convert 共用同一条文案：缺工具时明确说
+			// 缺工具，别让用户去怀疑自己的文件（见 estimate_handler.go 的说明）。
+			return fail(badRequestErr(convertErrMsg(err)))
 		}
 		pages = p
 	}
@@ -312,7 +314,7 @@ func convertForOrder(ctx context.Context, kind fileKind, storedAbs string, form 
 		pages, err := countPDFPages(outPath)
 		if err != nil {
 			cleanup()
-			return "", nil, 0, badRequestErr("failed to read pages")
+			return "", nil, 0, badRequestErr(countPagesErrMsg(err))
 		}
 		return outPath, cleanup, pages, nil
 
@@ -324,14 +326,14 @@ func convertForOrder(ctx context.Context, kind fileKind, storedAbs string, form 
 		pages, err := countPDFPages(outPath)
 		if err != nil {
 			cleanup()
-			return "", nil, 0, badRequestErr("failed to read pages")
+			return "", nil, 0, badRequestErr(countPagesErrMsg(err))
 		}
 		return outPath, cleanup, pages, nil
 
 	case fileKindImage:
 		outPath, cleanup, err := convertImageToPDF(storedAbs, form.Orientation, form.PaperSize, form.Invert)
 		if err != nil {
-			return "", nil, 0, badRequestErr("conversion failed")
+			return "", nil, 0, badRequestErr(convertErrMsg(err))
 		}
 		// 图片转出来的 PDF 恒为一页（与 printHandler 的 pages = 1 一致）。
 		return outPath, cleanup, 1, nil
@@ -339,11 +341,11 @@ func convertForOrder(ctx context.Context, kind fileKind, storedAbs string, form 
 	case fileKindText:
 		pages, err := estimateTextPages(storedAbs)
 		if err != nil {
-			return "", nil, 0, badRequestErr("failed to read pages")
+			return "", nil, 0, badRequestErr(countPagesErrMsg(err))
 		}
 		outPath, cleanup, err := convertTextToPDF(storedAbs, form.Orientation, form.PaperSize)
 		if err != nil {
-			return "", nil, 0, badRequestErr("conversion failed")
+			return "", nil, 0, badRequestErr(convertErrMsg(err))
 		}
 		return outPath, cleanup, pages, nil
 	}

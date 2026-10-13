@@ -72,6 +72,60 @@ export function statusText(status) {
   return map[status] || status
 }
 
+// ⚠️ 打印记录的状态与【订单】的状态是两套东西，别混用：
+//   记录：queued / printed / failed / cancelled
+//   订单：pending_payment / held / paid / printing / printed / failed / refunded / expired / cancelled
+// 拿 statusText 去渲染订单状态时，printing / refunded / expired 这些会落不到
+// 映射里、被原样透出英文。实测踩过：中间页的订单标签显示成 "printing"。
+//
+// 订单状态目前有多个使用者（PaymentModal、ResultView、AdminOrdersView、
+// 待取件列表），所以放在这里共用，不要再各写一份 —— 用户可见的文案分叉过就会漂。
+export function orderStatusColor(status) {
+  return {
+    pending_payment: 'warning',
+    // 待取件用 warning（需要用户【去做点什么】），不是 info（等着就行）。
+    held: 'warning',
+    paid: 'info',
+    printing: 'info',
+    printed: 'success',
+    failed: 'error',
+    refunded: 'neutral',
+    expired: 'neutral',
+    cancelled: 'neutral'
+  }[status] || 'neutral'
+}
+
+export function orderStatusText(status) {
+  return {
+    pending_payment: '待支付',
+    held: '待取件',
+    paid: '已支付',
+    printing: '打印中',
+    printed: '已打印',
+    failed: '失败',
+    refunded: '已退款',
+    expired: '已过期',
+    cancelled: '已取消'
+  }[status] || status
+}
+
+// 订单的支付方式（`print_orders.pay_method`）。
+//
+// 存的是渠道标识，不是给人看的字符串。空串 = 还没付款（订单仍在
+// pending_payment），也返回空串，让调用方整个不渲染这个标签。
+//
+// ⚠️ 认不出来的值返回空串而不是原样透出：把 `alipay` 这种渠道 id 印在
+// 用户界面上，看起来就像坏了。新增渠道时要在这里补一行 —— 漏了的表现是
+// 「这个渠道支付的订单不显示支付方式」，而不是显示一串英文。
+export function payMethodText(m) {
+  return {
+    balance: '余额支付',
+    alipay: '支付宝支付',
+    wechat: '微信支付',
+    mock: '模拟支付'
+  }[m] || ''
+}
+
 export function printerStateColor(state) {
   const map = { idle: 'success', processing: 'warning', stopped: 'error' }
   return map[state] || 'neutral'
@@ -81,6 +135,30 @@ export function printerStateText(state) {
   const map = { idle: '空闲', processing: '打印中', stopped: '已停止' }
   return map[state] || state || '未知'
 }
+
+// userLabel 把用户名渲染成【能放进表格】的样子 —— 只做长度保护，不做美化。
+//
+// ⚠️ 不要把它美化成「支付宝顾客」之类的标签。管理端的「用户名」筛选是【精确匹配】
+// （后端 `u.username = $1`），表格里显示什么，管理员就得能照着自己去搜什么 ——
+// 而"按用户名查某个人的订单 / 流水"正是那几个列表存在的意义。美化了就等于
+// 把这条路堵死：表格里写着「支付宝顾客」，搜索框里该输什么？
+//
+// 支付宝账号的用户名是 `alipay:<6 位 base32>`（见后端 alipayUsername），本身很短。
+// 但历史数据可能是老的 `alipay:<128 位 open_id>`，那种必须截断，否则撑破表格。
+export function userLabel(username) {
+  if (typeof username !== 'string') return username
+  const max = 24
+  return username.length > max ? username.slice(0, max - 1) + '…' : username
+}
+
+// ⚠️ 不要去"美化"用户名 —— 例如把 alipay:8F3K2Q 显示成「支付宝用户」。
+//
+// 曾经这么干过，被指出来是错的：顾客要退款、联系管理员时，管理员得知道【退谁】，
+// 而顾客能报出来的唯一凭据就是这个用户名。把它对顾客藏起来，等于把对账的唯一
+// 通路掐断 —— 管理员对着一个「支付宝用户」什么也查不到。
+//
+// 用户名之所以做成短的（见后端 alipayUsername），本来就【是为了能念给别人听】。
+// 所以顾客的个人中心、顶栏、管理端的表格，一律显示这个原值。
 
 export function markerLevelColor(level) {
   if (level === undefined || level === null) return 'text-muted'

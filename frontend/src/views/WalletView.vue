@@ -8,6 +8,17 @@
       <UButton variant="ghost" size="xs" icon="i-lucide-refresh" :loading="loading" @click="load">刷新</UButton>
     </div>
 
+    <!-- 加载失败必须显眼：下面的余额卡片在失败时会显示成 ¥0.00，
+         用户会以为钱丢了。这条提示要盖在它上面说清楚「这不是你的余额」。 -->
+    <UAlert
+      v-if="loadError"
+      color="error"
+      variant="soft"
+      icon="i-lucide-x-circle"
+      title="加载失败，下面的余额与订单可能不是最新的"
+      :description="loadError"
+    />
+
     <!-- 余额 -->
     <UCard>
       <div class="flex flex-wrap items-end justify-between gap-4">
@@ -72,10 +83,14 @@
                 退款将<span class="text-default">原路退回</span>到你当初付款的支付宝账户，不能退到别处。
               </p>
               <div class="flex flex-wrap items-center gap-2">
+                <!-- step / min 与「按分记账」对齐：步进器一次一分，而不是一次一元。
+                     ⚠️ 别把这两个属性当成拦路虎 —— 它们【只】影响步进器与浏览器的
+                     校验 API，拦不住用户直接输入的 0.01。真正把那一分吞掉的是
+                     fillFullRefund 里的 Math.floor，见下面的注释。 -->
                 <UInput
                   type="number"
-                  step="1"
-                  min="1"
+                  step="0.01"
+                  min="0.01"
                   v-model="refundYuan"
                   class="w-32"
                   placeholder="退款金额"
@@ -127,7 +142,14 @@
           :color="amountYuan === String(v) ? 'primary' : 'neutral'"
           @click="amountYuan = String(v)"
         >{{ v }} 元</UButton>
-        <UInput type="number" step="1" min="1" v-model="amountYuan" class="w-28" placeholder="自定义" />
+        <!-- 充值也按分记账：后端只校验 > 0 且 ≤ 100 万元，并没有 1 元起充。
+             原先写 step="1" min="1" 与退款那处同源，都是在声明一个程序里
+             并不存在的约束（也拦不住什么，只是步进器会整元跳）。 -->
+        <UInput type="number" step="0.01" min="0.01" v-model="amountYuan" class="w-28" placeholder="自定义" />
+        <!-- 渠道下拉带渠道 logo：这台机器上可能同时开着支付宝和微信，
+             只有文字的话用户得逐字读完才知道选的是哪个。
+             `leading` 管【收起时】显示的那个，`item-leading` 管展开后的每一项，
+             两个都要给 —— 只给一个的话总有一边是光秃秃的文字。 -->
         <USelect
           v-if="paymentMethods.length > 1"
           v-model="provider"
@@ -135,7 +157,14 @@
           value-key="value"
           label-key="label"
           class="w-40"
-        />
+        >
+          <template #leading>
+            <PayIcon :provider="provider" size="w-4 h-4" />
+          </template>
+          <template #item-leading="{ item }">
+            <PayIcon :provider="item.value" size="w-4 h-4" />
+          </template>
+        </USelect>
         <UButton
           color="primary"
           :loading="paying"
@@ -170,6 +199,7 @@
           <PaymentPanel
             v-if="cred"
             :cred="cred"
+            :provider="provider"
             :busy="paying"
             :refreshing="refreshingQr"
             :error="qrError"
@@ -192,42 +222,66 @@
     <!-- 订单 -->
     <UCard>
       <template #header>
-        <h2 class="text-lg font-bold flex items-center gap-2">
-          <UIcon name="i-lucide-receipt" class="w-5 h-5" />
-          打印订单
-        </h2>
+        <div class="flex items-center justify-between gap-2 cursor-pointer select-none" @click="ordersExpanded = !ordersExpanded">
+          <h2 class="text-lg font-bold flex items-center gap-2 min-w-0">
+            <UIcon name="i-lucide-receipt" class="w-5 h-5 shrink-0" />
+            打印订单
+            <!-- 折叠时补一行条数：收起之后也得能看出里面有没有东西，
+                 否则用户只能靠展开来确认，等于没省事。 -->
+            <span v-if="!ordersExpanded && orders.length > 0" class="text-xs font-normal text-muted truncate">
+              共 {{ orders.length }} 笔
+            </span>
+          </h2>
+          <UIcon
+            :name="ordersExpanded ? 'i-lucide-chevron-down' : 'i-lucide-chevron-right'"
+            class="w-4 h-4 text-muted transition-transform duration-200 shrink-0"
+          />
+        </div>
       </template>
 
-      <div v-if="loading" class="py-8 text-center text-muted">
-        <UIcon name="i-lucide-loader-circle" class="w-6 h-6 animate-spin inline-block" />
-        <div class="text-sm mt-2">加载中…</div>
-      </div>
-      <div v-else-if="orders.length === 0" class="py-8 text-center text-muted">
-        <UIcon name="i-lucide-inbox" class="w-10 h-10 opacity-40" />
-        <div class="text-sm mt-2">还没有订单</div>
-      </div>
-      <div v-else class="space-y-2">
-        <div
-          v-for="o in orders"
-          :key="o.orderId"
-          class="flex items-start justify-between gap-3 border border-default rounded-lg p-3"
-        >
-          <div class="min-w-0 flex-1">
-            <div class="flex items-center gap-2 flex-wrap">
-              <span class="font-medium truncate">{{ o.filename }}</span>
-              <UBadge :color="statusColor(o.status)" variant="subtle" size="sm">{{ statusText(o.status) }}</UBadge>
-            </div>
-            <div class="text-xs text-muted mt-1 flex flex-wrap gap-x-3">
-              <span>{{ formatTime(o.createdAt) }}</span>
-              <span>{{ o.billedPages }} 页<template v-if="o.copies > 1"> × {{ o.copies }} 份</template></span>
-              <span v-if="o.jobId">任务 {{ o.jobId }}</span>
-            </div>
-            <div v-if="o.error" class="text-xs text-error mt-1">{{ o.error }}</div>
-            <div v-if="o.refundedCents > 0" class="text-xs text-success mt-1">
-              已退款 {{ formatCents(o.refundedCents) }}（退回余额）
+      <div
+        class="transition-all duration-300 ease-in-out overflow-hidden"
+        :style="{ maxHeight: ordersExpanded ? listMaxHeight : '0px', visibility: ordersExpanded ? 'visible' : 'hidden' }"
+      >
+        <div :style="{ maxHeight: listMaxHeight }" class="overflow-y-auto">
+          <div v-if="loading" class="py-8 text-center text-muted">
+            <UIcon name="i-lucide-loader-circle" class="w-6 h-6 animate-spin inline-block" />
+            <div class="text-sm mt-2">加载中…</div>
+          </div>
+          <div v-else-if="orders.length === 0" class="py-8 text-center text-muted">
+            <UIcon name="i-lucide-inbox" class="w-10 h-10 opacity-40" />
+            <div class="text-sm mt-2">还没有订单</div>
+          </div>
+          <div v-else class="space-y-2">
+            <div
+              v-for="o in orders"
+              :key="o.orderId"
+              class="flex items-start justify-between gap-3 border border-default rounded-lg p-3"
+            >
+              <div class="min-w-0 flex-1">
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span class="font-medium truncate">{{ o.filename }}</span>
+                  <UBadge :color="statusColor(o.status)" variant="subtle" size="sm">{{ statusText(o.status) }}</UBadge>
+                </div>
+                <div class="text-xs text-muted mt-1 flex flex-wrap gap-x-3">
+                  <span>{{ formatTime(o.createdAt) }}</span>
+                  <span>{{ o.billedPages }} 页<template v-if="o.copies > 1"> × {{ o.copies }} 份</template></span>
+                  <!-- 支付方式：用户对账时最先要找的就是「这笔是从哪扣的」。
+                       未付款的订单 payMethod 是空的，标签整个不渲染。 -->
+                  <span v-if="payMethodText(o.payMethod)" class="inline-flex items-center gap-1">
+                    <PayIcon :provider="o.payMethod" size="w-3.5 h-3.5" />
+                    {{ payMethodText(o.payMethod) }}
+                  </span>
+                  <span v-if="o.jobId">任务 {{ o.jobId }}</span>
+                </div>
+                <div v-if="o.error" class="text-xs text-error mt-1">{{ o.error }}</div>
+                <div v-if="o.refundedCents > 0" class="text-xs text-success mt-1">
+                  已退款 {{ formatCents(o.refundedCents) }}（退回余额）
+                </div>
+              </div>
+              <div class="text-right shrink-0 font-medium">{{ formatCents(o.amountCents) }}</div>
             </div>
           </div>
-          <div class="text-right shrink-0 font-medium">{{ formatCents(o.amountCents) }}</div>
         </div>
       </div>
     </UCard>
@@ -235,36 +289,52 @@
     <!-- 流水 -->
     <UCard>
       <template #header>
-        <h2 class="text-lg font-bold flex items-center gap-2">
-          <UIcon name="i-lucide-list" class="w-5 h-5" />
-          余额流水
-        </h2>
+        <div class="flex items-center justify-between gap-2 cursor-pointer select-none" @click="txExpanded = !txExpanded">
+          <h2 class="text-lg font-bold flex items-center gap-2 min-w-0">
+            <UIcon name="i-lucide-list" class="w-5 h-5 shrink-0" />
+            余额流水
+            <span v-if="!txExpanded && transactions.length > 0" class="text-xs font-normal text-muted truncate">
+              共 {{ transactions.length }} 条
+            </span>
+          </h2>
+          <UIcon
+            :name="txExpanded ? 'i-lucide-chevron-down' : 'i-lucide-chevron-right'"
+            class="w-4 h-4 text-muted transition-transform duration-200 shrink-0"
+          />
+        </div>
       </template>
 
-      <div v-if="transactions.length === 0" class="py-6 text-center text-muted text-sm">暂无流水</div>
-      <div v-else class="overflow-x-auto">
-        <table class="w-full text-sm">
-          <thead>
-            <tr class="text-left text-muted border-b border-default">
-              <th class="py-2 pr-3 font-medium">时间</th>
-              <th class="py-2 pr-3 font-medium">类型</th>
-              <th class="py-2 pr-3 font-medium text-right">金额</th>
-              <th class="py-2 pr-3 font-medium text-right">余额</th>
-              <th class="py-2 font-medium">备注</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="t in transactions" :key="t.id" class="border-b border-default/50">
-              <td class="py-2 pr-3 whitespace-nowrap text-muted">{{ formatTime(t.createdAt) }}</td>
-              <td class="py-2 pr-3 whitespace-nowrap">{{ kindText(t.kind) }}</td>
-              <td class="py-2 pr-3 text-right whitespace-nowrap" :class="t.amountCents < 0 ? 'text-error' : 'text-success'">
-                {{ t.amountCents > 0 ? '+' : '' }}{{ formatCents(t.amountCents) }}
-              </td>
-              <td class="py-2 pr-3 text-right whitespace-nowrap text-muted">{{ formatCents(t.balanceAfterCents) }}</td>
-              <td class="py-2 text-muted">{{ t.note || '—' }}</td>
-            </tr>
-          </tbody>
-        </table>
+      <div
+        class="transition-all duration-300 ease-in-out overflow-hidden"
+        :style="{ maxHeight: txExpanded ? listMaxHeight : '0px', visibility: txExpanded ? 'visible' : 'hidden' }"
+      >
+        <div :style="{ maxHeight: listMaxHeight }" class="overflow-y-auto">
+          <div v-if="transactions.length === 0" class="py-6 text-center text-muted text-sm">暂无流水</div>
+          <div v-else class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="text-left text-muted border-b border-default">
+                  <th class="py-2 pr-3 font-medium">时间</th>
+                  <th class="py-2 pr-3 font-medium">类型</th>
+                  <th class="py-2 pr-3 font-medium text-right">金额</th>
+                  <th class="py-2 pr-3 font-medium text-right">余额</th>
+                  <th class="py-2 font-medium">备注</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="t in transactions" :key="t.id" class="border-b border-default/50">
+                  <td class="py-2 pr-3 whitespace-nowrap text-muted">{{ formatTime(t.createdAt) }}</td>
+                  <td class="py-2 pr-3 whitespace-nowrap">{{ kindText(t.kind) }}</td>
+                  <td class="py-2 pr-3 text-right whitespace-nowrap" :class="t.amountCents < 0 ? 'text-error' : 'text-success'">
+                    {{ t.amountCents > 0 ? '+' : '' }}{{ formatCents(t.amountCents) }}
+                  </td>
+                  <td class="py-2 pr-3 text-right whitespace-nowrap text-muted">{{ formatCents(t.balanceAfterCents) }}</td>
+                  <td class="py-2 text-muted">{{ t.note || '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </UCard>
   </div>
@@ -274,15 +344,37 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { apiFetch, readError, readJSON } from '../utils/api'
-import { formatCents, formatTime } from '../utils/format'
+import { paymentSettledTick } from '../utils/paymentSignal'
+import {
+  formatCents, formatTime, payMethodText,
+  // ⚠️ 订单状态要用 orderStatus*，不是 status*（后者是【打印记录】的状态）
+  orderStatusColor as statusColor,
+  orderStatusText as statusText
+} from '../utils/format'
 import { payChannel } from '../utils/device'
 import PaymentPanel from '../components/PaymentPanel.vue'
+import PayIcon from '../components/PayIcon.vue'
 
 const emit = defineEmits(['logout'])
 const route = useRoute()
 
 const loading = ref(true)
+// 拉取失败的原因。非空时页面顶部弹一条错误 —— 因为下面的卡片在失败时
+// 会把余额显示成 ¥0.00（wallet 的初值），那是在把「取不到」谎报成「零」。
+const loadError = ref('')
 const wallet = ref({ balanceCents: 0, transactions: [], paymentMethods: [] })
+
+// ── 两个长列表默认收起 ────────────────────────────────────────────
+//
+// 订单最多 100 条、流水最多 50 条（服务端上限），全展开往下滚要划很久；
+// 而钱包页真正要一眼看到的是【余额】和【充值按钮】，它们在页面最上面。
+// 收起态在标题旁留一行条数摘要，展开后限高并内部滚动 ——
+// 列表再长也撑不破页面。
+//
+// 折叠动画与标题样式照抄 PrintRecordList（同一套写法，改的时候对照着改）。
+const ordersExpanded = ref(false)
+const txExpanded = ref(false)
+const listMaxHeight = '30rem'
 const orders = ref([])
 
 // ─── 充值 ───────────────────────────────────────────────
@@ -330,9 +422,16 @@ function openRefund() {
 }
 
 // fillFullRefund 一键填满可退额度。
-// 取 Math.floor 而不是四舍五入：宁可少退一分，也不要因为凑整而超额被拒。
+//
+// ⚠️ 不能写 `Math.floor(cents / 100)` —— 那是在【元】这一级取整，会把不足
+// 1 元的部分整个抹掉：可退 1 分时算出来是 0，用户点「全部退款」看到的是
+// 0 元，然后按钮是禁用的（refundCents <= 0），等于这一分永远退不了。
+//
+// 原注释写的是「宁可少退一分，也不要因为凑整而超额被拒」，方向恰好搞反了：
+// 该保住的正是那一分。用定点小数转成元，与 refundCents 的 ×100+round
+// 互为逆运算，不会多也不会少。
 function fillFullRefund() {
-  refundYuan.value = String(Math.floor(refundableCents.value / 100))
+  refundYuan.value = (refundableCents.value / 100).toFixed(2)
 }
 
 async function submitRefund() {
@@ -367,6 +466,7 @@ const amountCents = computed(() => Math.round((Number(amountYuan.value) || 0) * 
 
 async function load() {
   loading.value = true
+  loadError.value = ''
   try {
     const [walletResp, ordersResp] = await Promise.all([
       apiFetch('/api/wallet', {}, () => emit('logout')),
@@ -377,11 +477,23 @@ async function load() {
       if (!provider.value && paymentMethods.value.length > 0) {
         provider.value = paymentMethods.value[0]
       }
+    } else {
+      // ⚠️ 拉不到就必须说，不能保持初值。
+      //
+      // wallet 的初值是 { balanceCents: 0, ... }，静默失败时页面顶部会把
+      // 「¥0.00」当成真实余额显示出来 —— 用户看到的第一反应是「我的钱没了」，
+      // 然后来报障。这比「没反应」严重得多：它是【错误数据】。
+      loadError.value = await readError(walletResp)
     }
     if (ordersResp.ok) {
       const data = await readJSON(ordersResp)
       orders.value = Array.isArray(data) ? data : []
+    } else if (!loadError.value) {
+      // 订单列表拉不到时，卡片会显示「还没有订单」——同样是在撒谎。
+      loadError.value = await readError(ordersResp)
     }
+  } catch (e) {
+    loadError.value = e?.message || String(e)
   } finally {
     loading.value = false
   }
@@ -589,6 +701,13 @@ onUnmounted(() => {
   stopTopupPolling()
 })
 
+// 回跳结算完成后重拉一次余额与流水。
+//
+// ⚠️ 不能指望 onMounted 那次 load 就能拿到新余额：App.vue 的补查单跑在
+// 它自己的 onMounted 里，而 Vue 是【子组件先挂载】—— 我们的 load 比结算更早，
+// 拿到的是到账前的旧值。详见 utils/paymentSignal.js。
+watch(paymentSettledTick, () => { load() })
+
 onMounted(load)
 
 // ⚠️ refund 与 withdraw 是两件不同的事，文案上必须分开：
@@ -604,25 +723,7 @@ const kindText = (k) => ({
   admin_adjust: '管理员调整'
 }[k] || k)
 
-const statusColor = (s) => ({
-  pending_payment: 'warning',
-  paid: 'info',
-  printing: 'info',
-  printed: 'success',
-  failed: 'error',
-  refunded: 'neutral',
-  expired: 'neutral',
-  cancelled: 'neutral'
-}[s] || 'neutral')
-
-const statusText = (s) => ({
-  pending_payment: '待支付',
-  paid: '已支付',
-  printing: '打印中',
-  printed: '已打印',
-  failed: '失败',
-  refunded: '已退款',
-  expired: '已过期',
-  cancelled: '已取消'
-}[s] || s)
+// 订单状态的文案与配色统一放在 utils/format（orderStatus*）—— 这里原先是
+// 第三份拷贝（另有 PaymentModal 与 ResultView 各一份）。用户可见的文案
+// 分叉过就会漂，所以收到一处。
 </script>

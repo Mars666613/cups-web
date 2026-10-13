@@ -203,6 +203,17 @@ func adminUpdatePricesHandler(w http.ResponseWriter, r *http.Request) {
 			if guestMode != 0 {
 				return errors.New("开启计费前请先关闭访客模式：访客是所有人共用的账号，余额无法追责")
 			}
+
+			// 取件模式与计费互斥（反方向在 adminUpdateSettingsHandler 里校验）。
+			// 两者都在描述「谁是这个部署的打印入口」：一个要求先付钱、
+			// 一个压根不收费，同时开启会让 /api/print 既该 403 又该暂存。
+			pullMode, err := store.GetSettingInt(ctx, tx, store.SettingPullModeEnabled, 0)
+			if err != nil {
+				return err
+			}
+			if pullMode != 0 {
+				return errors.New("开启计费前请先关闭刷卡取件模式")
+			}
 		}
 
 		if payload.Enabled != nil {

@@ -67,7 +67,7 @@ func ReplacePriceRules(ctx context.Context, tx *sql.Tx, rules []PriceRule) error
 	now := nowUTC()
 	stmt, err := tx.PrepareContext(ctx, `INSERT INTO price_rules (
 		is_color, paper_size, paper_type, unit_price_cents, updated_at
-	) VALUES (?, ?, ?, ?, ?)`)
+	) VALUES ($1, $2, $3, $4, $5)`)
 	if err != nil {
 		return fmt.Errorf("prepare price rule insert: %w", err)
 	}

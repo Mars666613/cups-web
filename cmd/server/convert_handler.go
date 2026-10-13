@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 func convertHandler(w http.ResponseWriter, r *http.Request) {
@@ -128,6 +129,19 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 	streamPDF(w, outPath, outFilename)
 }
 
+// ── 底层错误 → 用户看得懂的一句话 ─────────────────────────────────────
+//
+// ⚠️ 这三个函数是【唯一】的出口，四条孪生流水线（print / reprint / order /
+// scheduled）都从这里取文案。
+//
+// 为什么必须集中：这四条路径是同一段逻辑的复制，过去各写各的硬编码英文
+// 兜底（"failed to read pages" / "conversion failed" / "failed to save
+// converted file"），只有一两条接了分层处理。结果是【用户拿到的提示取决于
+// 他点的是哪个入口】，而真正的根因 —— 服务器没装转换工具、磁盘满了、
+// 文件损坏 —— 被同一句话吞掉。实测就因此让人反复怀疑自己的文件。
+//
+// 加新的错误分支时改这里一处，四条路径同时受益。
+
 func convertErrMsg(err error) string {
 	if errors.Is(err, errBinaryNotInstalled) {
 		return "服务器未安装 LibreOffice，无法转换 Office 文档。请联系管理员安装 LibreOffice。"
@@ -136,6 +150,32 @@ func convertErrMsg(err error) string {
 		return "服务器缺少文件转换所需的工具，请联系管理员安装相关依赖。"
 	}
 	return "文件转换失败：" + err.Error()
+}
+
+// countPagesErrMsg 数不出页数。
+//
+// 注意 docx / OFD 的页数要先转换成 PDF 才数得出来，所以这条路上同样会撞见
+// 「缺工具」—— 直接报「读不出页数」会让人去怀疑文件，文案复用 convertErrMsg。
+func countPagesErrMsg(err error) string {
+	if errors.Is(err, errBinaryNotInstalled) {
+		return convertErrMsg(err)
+	}
+	return "无法读取文件页数：" + err.Error()
+}
+
+// saveErrMsg 落盘失败。
+//
+// 单独成函数的意义在于把「服务器的问题」和「文件的问题」分开：磁盘满、
+// 只读挂载、权限不足这些，用户重试一百次也不会好，得让管理员去 df -h。
+// 只说一句「保存失败」，用户的第一反应是换个文件重试。
+func saveErrMsg(err error) string {
+	switch {
+	case errors.Is(err, syscall.ENOSPC):
+		return "服务器磁盘空间不足，无法保存文件。请联系管理员清理空间。"
+	case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EROFS):
+		return "服务器无法写入文件（权限不足或文件系统只读）。请联系管理员。"
+	}
+	return "保存文件失败：" + err.Error()
 }
 
 // parseRotations 解析多图合一的逐图旋转参数（issue #87）。

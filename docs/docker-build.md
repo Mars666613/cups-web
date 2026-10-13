@@ -65,7 +65,7 @@ Eclipse Temurin 对 "Linux ARM 32-bit Hard-Float" 仅 JDK 8/11 有二进制，JD
 | `LISTEN_ADDR=:1180` | host 网络无端口映射，让 Web 直接监听宿主 1180，老用户书签 / 反代不用改（`cmd/server/main.go` 原生支持该环境变量） |
 | `user: root` | 要跑 cupsd / lpadmin / dpkg，还要往系统路径写驱动文件 |
 | `security_opt: [apparmor:unconfined]` | issue #91：PVE LXC 等环境下 `apparmor="DENIED" … comm="jobs.cgi"` 会导致打印失败；合并单容器后它同时也保护 LibreOffice / OFD 转换子进程 |
-| `./.etc:/etc/cups`、`./.data:/data`、`./.uploads:/uploads` | CUPS 配置 / 数据库 / 上传文件持久化 |
+| `./.etc:/etc/cups`、`./.uploads:/uploads` | CUPS 配置 / 上传文件持久化。⚠️ 数据库已改为**外部 PostgreSQL**（`DATABASE_URL`），原先的 `./.data:/data` 卷已删除 |
 | **`./.drivers:/opt/cups-drivers/data`** | **驱动快照持久化**。删掉这个卷 = 重启后丢失所有手动安装的第三方驱动，需要在 Web「驱动」页面重装一遍（见 [driver-management.md](driver-management.md)） |
 | `/dev/bus/usb:/dev/bus/usb` + `device_cgroup_rules: ['c 189:* rmw']` | issue #81：USB 打印机热插拔。`devices:` 是启动时一次性绑定，打印机"后开机"时宿主 udev 新建的节点不会传播进容器；改成目录 bind-mount 才能实时反映新节点 |
 | `/run/udev:/run/udev:ro` | 让 libusb 读到设备属性，改善识别（宿主无 `/run/udev` 时该挂载可删） |
@@ -82,8 +82,8 @@ Eclipse Temurin 对 "Linux ARM 32-bit Hard-Float" 仅 JDK 8/11 有二进制，JD
 补充说明：
 
 - `linux/armv7` 使用 `GOARCH=arm` + `GOARM=7`，覆盖树莓派 2/3、主流 ARM SBC 等 32 位硬浮点设备；matrix 里通过 `goarm` 字段声明，Build 步骤已把 `GOARM` 透传到 `env`（其他非 arm 目标此字段为空不生效）。
-- `linux/loong64` 依赖 `modernc.org/sqlite` ≥ `v1.34`（`v1.29.0` 尚未支持 loong64 架构）。
-- 由于全仓严格 `CGO_ENABLED=0`，新增其他 modernc 已支持的架构（`riscv64` / `s390x` / `ppc64le` 等）只需往 `build-release.yml` 的 matrix 里加一行 `goos/goarch/suffix`，无需额外工具链。
+- 由于全仓严格 `CGO_ENABLED=0`，新增其他架构（`riscv64` / `s390x` / `ppc64le` 等）只需往 `build-release.yml` 的 matrix 里加一行 `goos/goarch/suffix`，无需额外工具链 —— `pgx/v5` 是纯 Go 实现。
+- ⚠️ 历史注记：迁移到 PostgreSQL 之前数据库用的是 `modernc.org/sqlite`（纯 Go，无 CGO），`linux/loong64` 那条曾依赖它 ≥ `v1.34`。现在这个约束已经不存在了。
 
 ## 版本管理
 

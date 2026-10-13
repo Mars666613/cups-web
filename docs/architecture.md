@@ -9,7 +9,7 @@
 | Go | 1.26（见 `go.mod`） |
 | HTTP 路由 | `github.com/gorilla/mux` |
 | 会话管理 | `github.com/gorilla/securecookie` |
-| 数据库 | `modernc.org/sqlite`（纯 Go，无 CGO） |
+| 数据库 | `github.com/jackc/pgx/v5`（走它的 `database/sql` 兼容层 `stdlib`）。⚠️ 曾用 `modernc.org/sqlite`，已迁到 PostgreSQL，见 [AGENTS.md 的数据库一节](../AGENTS.md#️-数据库) |
 | 打印协议 | `github.com/OpenPrinting/goipp`（IPP） |
 | PDF 解析 | `rsc.io/pdf`（页数读取）、`github.com/phpdave11/gofpdf`（PDF 生成） |
 | 图像缩放 | `golang.org/x/image/draw`（CatmullRom，用于大图下采样） |

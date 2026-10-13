@@ -77,23 +77,25 @@ func InsertPayment(ctx context.Context, tx *sql.Tx, p *Payment) (int64, error) {
 		p.CreatedAt = now
 	}
 	p.UpdatedAt = now
-	res, err := tx.ExecContext(ctx, `INSERT INTO payments (
+	var id int64
+	err := tx.QueryRowContext(ctx, `INSERT INTO payments (
 		user_id, purpose, provider, out_trade_no, amount_cents, refunded_cents,
 		status, transaction_id, prepay_payload, raw_callback, paid_at, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	RETURNING id`,
 		p.UserID, p.Purpose, p.Provider, p.OutTradeNo, p.AmountCents, p.RefundedCents,
 		p.Status, p.TransactionID, p.PrepayPayload, p.RawCallback, p.PaidAt, p.CreatedAt, p.UpdatedAt,
-	)
+	).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	return id, nil
 }
 
 func GetPaymentByID(ctx context.Context, tx *sql.Tx, id int64) (Payment, error) {
 	row := tx.QueryRowContext(ctx, `SELECT `+paymentColumns+`
 		FROM payments p JOIN users u ON u.id = p.user_id
-		WHERE p.id = ?`, id)
+		WHERE p.id = $1`, id)
 	return scanPayment(row)
 }
 
@@ -107,7 +109,7 @@ func GetPaymentByID(ctx context.Context, tx *sql.Tx, id int64) (Payment, error) 
 func GetPaymentByOutTradeNo(ctx context.Context, tx *sql.Tx, outTradeNo string) (Payment, error) {
 	row := tx.QueryRowContext(ctx, `SELECT `+paymentColumns+`
 		FROM payments p JOIN users u ON u.id = p.user_id
-		WHERE p.out_trade_no = ?`, outTradeNo)
+		WHERE p.out_trade_no = $1`, outTradeNo)
 	return scanPayment(row)
 }
 
@@ -119,8 +121,8 @@ func GetPaymentByOutTradeNo(ctx context.Context, tx *sql.Tx, outTradeNo string) 
 func MarkPaymentPaid(ctx context.Context, tx *sql.Tx, id int64, transactionID string) (bool, error) {
 	now := nowUTC()
 	res, err := tx.ExecContext(ctx, `UPDATE payments
-		SET status = ?, transaction_id = ?, paid_at = ?, updated_at = ?
-		WHERE id = ? AND status <> ?`,
+		SET status = $1, transaction_id = $2, paid_at = $3, updated_at = $4
+		WHERE id = $5 AND status <> $6`,
 		PaymentStatusPaid, transactionID, now, now, id, PaymentStatusPaid)
 	if err != nil {
 		return false, err
@@ -135,8 +137,8 @@ func MarkPaymentPaid(ctx context.Context, tx *sql.Tx, id int64, transactionID st
 // MarkPaymentFailed 把支付单置为失败（渠道明确返回失败，或用户放弃）。
 func MarkPaymentFailed(ctx context.Context, tx *sql.Tx, id int64, raw string) error {
 	_, err := tx.ExecContext(ctx, `UPDATE payments
-		SET status = ?, raw_callback = ?, updated_at = ?
-		WHERE id = ? AND status = ?`,
+		SET status = $1, raw_callback = $2, updated_at = $3
+		WHERE id = $4 AND status = $5`,
 		PaymentStatusFailed, raw, nowUTC(), id, PaymentStatusCreated)
 	return err
 }
@@ -150,8 +152,8 @@ func MarkPaymentFailed(ctx context.Context, tx *sql.Tx, id int64, raw string) er
 // 刚好付款成功，这里命中 0 行，结算流程不受影响。
 func MarkPaymentClosed(ctx context.Context, tx *sql.Tx, id int64) error {
 	_, err := tx.ExecContext(ctx, `UPDATE payments
-		SET status = ?, updated_at = ?
-		WHERE id = ? AND status = ?`,
+		SET status = $1, updated_at = $2
+		WHERE id = $3 AND status = $4`,
 		PaymentStatusClosed, nowUTC(), id, PaymentStatusCreated)
 	return err
 }
@@ -159,7 +161,7 @@ func MarkPaymentClosed(ctx context.Context, tx *sql.Tx, id int64) error {
 // SetPaymentPrepay 回写渠道返回的支付凭据（二维码内容 / 跳转链接）。
 func SetPaymentPrepay(ctx context.Context, tx *sql.Tx, id int64, payload string) error {
 	_, err := tx.ExecContext(ctx,
-		`UPDATE payments SET prepay_payload = ?, updated_at = ? WHERE id = ?`,
+		`UPDATE payments SET prepay_payload = $1, updated_at = $2 WHERE id = $3`,
 		payload, nowUTC(), id)
 	return err
 }
@@ -167,7 +169,7 @@ func SetPaymentPrepay(ctx context.Context, tx *sql.Tx, id int64, payload string)
 // SetPaymentRawCallback 记录最近一次回调原文（排障用，尤其是金额不匹配时）。
 func SetPaymentRawCallback(ctx context.Context, tx *sql.Tx, id int64, raw string) error {
 	_, err := tx.ExecContext(ctx,
-		`UPDATE payments SET raw_callback = ?, updated_at = ? WHERE id = ?`,
+		`UPDATE payments SET raw_callback = $1, updated_at = $2 WHERE id = $3`,
 		raw, nowUTC(), id)
 	return err
 }
@@ -178,7 +180,7 @@ func SetPaymentRawCallback(ctx context.Context, tx *sql.Tx, id int64, raw string
 // 一个 3 订单的支付单里 1 个打印失败，只退那一个的金额。
 func AddPaymentRefunded(ctx context.Context, tx *sql.Tx, id int64, amountCents int64) error {
 	_, err := tx.ExecContext(ctx, `UPDATE payments
-		SET refunded_cents = refunded_cents + ?, updated_at = ? WHERE id = ?`,
+		SET refunded_cents = refunded_cents + $1, updated_at = $2 WHERE id = $3`,
 		amountCents, nowUTC(), id)
 	return err
 }
@@ -211,7 +213,7 @@ func (r RefundableTopup) Remaining() int64 { return r.AmountCents - r.Refunded }
 func ListRefundableTopups(ctx context.Context, tx *sql.Tx, userID int64) ([]RefundableTopup, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT id, provider, out_trade_no, amount_cents, refunded_cents
 		FROM payments
-		WHERE user_id = ? AND purpose = ? AND status = ? AND provider <> ?
+		WHERE user_id = $1 AND purpose = $2 AND status = $3 AND provider <> $4
 		  AND refunded_cents < amount_cents
 		ORDER BY id`, userID, PaymentPurposeTopup, PaymentStatusPaid, PaymentProviderBalance)
 	if err != nil {
@@ -242,33 +244,32 @@ type PaymentFilter struct {
 func ListPayments(ctx context.Context, tx *sql.Tx, filter PaymentFilter) ([]Payment, error) {
 	args := []interface{}{}
 	conds := []string{"1=1"}
+	// 同 ListPrintRecords：追加实参与取占位符绑成一步。
+	arg := func(v interface{}) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
 	if filter.Username != "" {
-		conds = append(conds, "u.username = ?")
-		args = append(args, filter.Username)
+		conds = append(conds, "u.username = "+arg(filter.Username))
 	}
 	if filter.Status != "" {
-		conds = append(conds, "p.status = ?")
-		args = append(args, filter.Status)
+		conds = append(conds, "p.status = "+arg(filter.Status))
 	}
 	if filter.Purpose != "" {
-		conds = append(conds, "p.purpose = ?")
-		args = append(args, filter.Purpose)
+		conds = append(conds, "p.purpose = "+arg(filter.Purpose))
 	}
 	if filter.StartAt != "" {
-		conds = append(conds, "p.created_at >= ?")
-		args = append(args, filter.StartAt)
+		conds = append(conds, "p.created_at >= "+arg(filter.StartAt))
 	}
 	if filter.EndAt != "" {
-		conds = append(conds, "p.created_at <= ?")
-		args = append(args, filter.EndAt)
+		conds = append(conds, "p.created_at <= "+arg(filter.EndAt))
 	}
 	query := fmt.Sprintf(`SELECT `+paymentColumns+`
 		FROM payments p JOIN users u ON u.id = p.user_id
 		WHERE %s
 		ORDER BY p.created_at DESC, p.id DESC`, strings.Join(conds, " AND "))
 	if filter.Limit > 0 {
-		query += " LIMIT ?"
-		args = append(args, filter.Limit)
+		query += " LIMIT " + arg(filter.Limit)
 	}
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -302,8 +303,8 @@ type UnsettledPayment struct {
 func ListUnsettledOnlinePayments(ctx context.Context, tx *sql.Tx,
 	createdBefore string, limit int) ([]UnsettledPayment, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT id, provider, out_trade_no FROM payments
-		WHERE status = ? AND provider <> ? AND created_at < ?
-		ORDER BY id LIMIT ?`,
+		WHERE status = $1 AND provider <> $2 AND created_at < $3
+		ORDER BY id LIMIT $4`,
 		PaymentStatusCreated, PaymentProviderBalance, createdBefore, limit)
 	if err != nil {
 		return nil, err
@@ -334,7 +335,7 @@ func GetUnsettledPaymentByBatch(ctx context.Context, tx *sql.Tx, batchID string)
 	err := tx.QueryRowContext(ctx, `SELECT p.id, p.provider, p.out_trade_no
 		FROM payments p
 		JOIN print_orders o ON o.payment_id = p.id
-		WHERE o.batch_id = ? AND p.status = ? AND p.provider <> ?
+		WHERE o.batch_id = $1 AND p.status = $2 AND p.provider <> $3
 		LIMIT 1`,
 		batchID, PaymentStatusCreated, PaymentProviderBalance).
 		Scan(&p.ID, &p.Provider, &p.OutTradeNo)

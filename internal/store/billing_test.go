@@ -4,15 +4,69 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"path/filepath"
+	"fmt"
+	"math/rand"
+	"net/url"
+	"os"
+	"strings"
 	"testing"
+	"time"
 )
 
-// openTestStore 建一个临时库并跑完迁移。
+// withSearchPath 在 DSN 上追加 search_path 选项。
+//
+// ⚠️ 走 DSN 而不是执行 `SET search_path`：连接池里每条连接都要生效，
+// 而 SET 只影响当前那一条 —— 表现是「测试偶尔查不到表」，极难查。
+func withSearchPath(dsn, schema string) string {
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	// ⚠️ 空格必须编成 %20，不能留 url.QueryEscape 默认的 '+'：
+	// pgx/libpq 会把 '+' 当成参数名的一部分，报
+	// 「unrecognized configuration parameter "+search_path"」。
+	opt := strings.ReplaceAll(url.QueryEscape("-c search_path="+schema), "+", "%20")
+	return dsn + sep + "options=" + opt
+}
+
+// testSchema 建一个随机 schema 并把 search_path 指过去，返回可直接用的 DSN。
+//
+// ⚠️ 需要环境变量 TEST_DATABASE_URL。未设置时【跳过】而不是失败 ——
+// 没装 PG 的机器上 `go test ./...` 不该是红的。
+//
+//	TEST_DATABASE_URL='postgres://postgres@127.0.0.1:5432/cupsweb?sslmode=disable' go test ./...
+//
+// 隔离：随机 schema + search_path，结束后 DROP ... CASCADE。
+// 不共用一个 schema，是为了测试之间互不污染、且可以并发跑。
+//
+// 同一测试内多次 Open 请复用同一个返回值 —— 那样才共享同一个 schema。
+func testSchema(t *testing.T) string {
+	t.Helper()
+	base := os.Getenv("TEST_DATABASE_URL")
+	if base == "" {
+		t.Skip("TEST_DATABASE_URL 未设置，跳过需要 PostgreSQL 的测试")
+	}
+	schema := fmt.Sprintf("t%d_%d", time.Now().UnixNano()%1e9, rand.Intn(10000))
+
+	admin, err := sql.Open("pgx", base)
+	if err != nil {
+		t.Fatalf("连接测试库失败: %v", err)
+	}
+	if _, err := admin.Exec("CREATE SCHEMA " + schema); err != nil {
+		_ = admin.Close()
+		t.Fatalf("建 schema 失败: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec("DROP SCHEMA " + schema + " CASCADE")
+		_ = admin.Close()
+	})
+	return withSearchPath(base, schema)
+}
+
+// openTestStore 开一个隔离 schema 的测试库。
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "test.db")
-	s, err := Open(context.Background(), path)
+	s, err := Open(context.Background(), testSchema(t), 4)
 	if err != nil {
 		t.Fatalf("打开测试库失败: %v", err)
 	}
@@ -70,16 +124,11 @@ func createTestUser(t *testing.T, s *Store, username string) int64 {
 	t.Helper()
 	var id int64
 	mustExec(t, s, func(ctx context.Context, tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `INSERT INTO users
+		return tx.QueryRowContext(ctx, `INSERT INTO users
 			(username, password_hash, role, protected, contact_name, phone, email,
 			 balance_cents, created_at, updated_at)
-			VALUES (?, 'x', 'user', 0, '', '', '', 0, ?, ?)`,
-			username, nowUTC(), nowUTC())
-		if err != nil {
-			return err
-		}
-		id, err = res.LastInsertId()
-		return err
+			VALUES ($1, 'x', 'user', false, '', '', '', 0, $2, $3) RETURNING id`,
+			username, nowUTC(), nowUTC()).Scan(&id)
 	})
 	return id
 }
@@ -128,51 +177,43 @@ func TestMigrationCreatesBillingSchema(t *testing.T) {
 
 	tables := []string{"price_rules", "print_orders", "payments", "wallet_transactions"}
 	for _, table := range tables {
-		n := countRows(t, s, "sqlite_master", "type = 'table' AND name = ?", table)
+		n := countRows(t, s, "information_schema.tables",
+			"table_schema = current_schema() AND table_name = $1", table)
 		if n != 1 {
 			t.Errorf("表 %s 没有被创建", table)
 		}
 	}
 
-	// users 的新列
-	var count int
-	err := s.WithTx(context.Background(), true, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(context.Background(), `PRAGMA table_info(users)`)
-		if err != nil {
-			return err
+	// users 的新列。
+	//   balance_cents —— 计费加的
+	//   alipay_open_id —— 支付宝授权登录加的。⚠️ 它走的是 ALTER TABLE，
+	//     是本仓库第一条 ALTER，所以尤其要验：新库靠 CREATE、存量库靠 ALTER，
+	//     两条路径都得有这一列。
+	for _, col := range []string{"balance_cents", "alipay_open_id"} {
+		n := countRows(t, s, "information_schema.columns",
+			"table_schema = current_schema() AND table_name = 'users' AND column_name = $1", col)
+		if n != 1 {
+			t.Errorf("users.%s 不存在（找到 %d 次）", col, n)
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var cid int
-			var name, ctype string
-			var notnull, pk int
-			var dflt sql.NullString
-			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-				return err
-			}
-			if name == "balance_cents" {
-				count++
-			}
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		t.Fatalf("读 users 表结构失败: %v", err)
 	}
-	if count != 1 {
-		t.Errorf("users.balance_cents 不存在（找到 %d 次）", count)
+
+	// 支付宝 open_id 的【部分】唯一索引。少了它，同一个支付宝号能建出多个账号；
+	// 写成普通唯一索引则会误伤大量 alipay_open_id = '' 的普通账号。
+	if n := countRows(t, s, "pg_indexes",
+		"schemaname = current_schema() AND tablename = 'users' AND indexname = 'idx_users_alipay_open_id'"); n != 1 {
+		t.Errorf("idx_users_alipay_open_id 不存在（找到 %d 次）", n)
 	}
 }
 
-// TestMigrationIsIdempotent 在同一个库文件上反复 Open。
-// migrate() 没有任何 schema 版本表，全靠幂等 DDL —— 老库热升级时
-// 这条路径必须能重复走，否则用户升级一次就再也起不来。
+// TestMigrationIsIdempotent 在同一个 schema 上反复 Open。
+// 建表全是 IF NOT EXISTS，没有 schema 版本表 —— 老部署重复启动时
+// 这条路径必须能走，否则用户升级一次就再也起不来。
 func TestMigrationIsIdempotent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "twice.db")
+	dsn := testSchema(t) // 三次 Open 复用同一个 schema
 	ctx := context.Background()
 
 	for i := 1; i <= 3; i++ {
-		s, err := Open(ctx, path)
+		s, err := Open(ctx, dsn, 4)
 		if err != nil {
 			t.Fatalf("第 %d 次 Open 失败: %v", i, err)
 		}
@@ -247,7 +288,7 @@ func TestApplyWalletDeltaTopupThenSpend(t *testing.T) {
 	if got := balanceOf(t, s, uid); got != 750 {
 		t.Errorf("库里余额 = %d，期望 750", got)
 	}
-	if n := countRows(t, s, "wallet_transactions", "user_id = ?", uid); n != 2 {
+	if n := countRows(t, s, "wallet_transactions", "user_id = $1", uid); n != 2 {
 		t.Errorf("流水条数 = %d，期望 2", n)
 	}
 }
@@ -281,7 +322,7 @@ func TestApplyWalletDeltaInsufficientBalance(t *testing.T) {
 	if got := balanceOf(t, s, uid); got != 100 {
 		t.Errorf("失败后余额 = %d，期望仍为 100（不能扣掉）", got)
 	}
-	if n := countRows(t, s, "wallet_transactions", "kind = ?", WalletKindSpend); n != 0 {
+	if n := countRows(t, s, "wallet_transactions", "kind = $1", WalletKindSpend); n != 0 {
 		t.Errorf("失败后残留了 %d 条扣款流水，期望 0", n)
 	}
 }
@@ -344,7 +385,7 @@ func TestApplyWalletDeltaIsIdempotent(t *testing.T) {
 	if got := balanceOf(t, s, uid); got != 500 {
 		t.Errorf("余额 = %d，期望 500（重复入账只能生效一次）", got)
 	}
-	if n := countRows(t, s, "wallet_transactions", "idempotency_key = ?", key); n != 1 {
+	if n := countRows(t, s, "wallet_transactions", "idempotency_key = $1", key); n != 1 {
 		t.Errorf("同键流水条数 = %d，期望 1", n)
 	}
 }
@@ -500,10 +541,10 @@ func TestMarkPendingOrdersExpiredIsAtomic(t *testing.T) {
 		return err
 	})
 
-	if n := countRows(t, s, "print_orders", "batch_id = ? AND status = ?", "BATCH-X", OrderStatusExpired); n != 3 {
+	if n := countRows(t, s, "print_orders", "batch_id = $1 AND status = $2", "BATCH-X", OrderStatusExpired); n != 3 {
 		t.Errorf("过期订单数 = %d，期望 3", n)
 	}
-	if n := countRows(t, s, "print_orders", "batch_id = ? AND status = ?", "BATCH-X", OrderStatusPendingPayment); n != 0 {
+	if n := countRows(t, s, "print_orders", "batch_id = $1 AND status = $2", "BATCH-X", OrderStatusPendingPayment); n != 0 {
 		t.Errorf("残留待支付订单 %d 条，期望 0", n)
 	}
 }

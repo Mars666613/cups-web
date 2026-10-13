@@ -22,6 +22,9 @@ var (
 	errAdminRename        = errors.New("admin username cannot change")
 	errDeleteGuest        = errors.New("guest user cannot be deleted")
 	errGuestModify        = errors.New("guest user is managed automatically")
+	// alipay: 前缀是支付宝授权登录自动建号的命名空间。改名【进】这个空间会让
+	// 管理端把普通账号误显示成"支付宝顾客"，所以挡住；改出去不挡。
+	errAlipayNamespace = errors.New("alipay: prefix is reserved for wechat login accounts")
 	// 财务记录守卫：删除用户会级联抹掉他的账本与订单。
 	errUserHasBalance      = errors.New("user still has balance")
 	errUserHasTransactions = errors.New("user has wallet transactions")
@@ -44,6 +47,16 @@ type adminUserResponse struct {
 	ContactName string `json:"contactName"`
 	Phone       string `json:"phone"`
 	Email       string `json:"email"`
+	// IsAlipay 为真表示这是支付宝授权登录自动创建的账号。
+	// 它的 username 是一长串 alipay:<open_id>，直接铺在表格里没法看 ——
+	// 前端据此显示成「支付宝顾客」。
+	IsAlipay bool `json:"isAlipay"`
+	// CardNo 是绑定的 NFC 工牌号，'' = 没绑。刷卡取件模式下它就是员工的取件凭据。
+	//
+	// 原样返回（不截断、不打码）：管理员要能核对「这张卡绑对了没有」，
+	// 而且卡号本身就是读卡器读出来的任意字符串，打码反而看不出格式对不对。
+	// 前端负责把它显示的短一些（像用户名那样）。
+	CardNo string `json:"cardNo"`
 	// 单位「分」，前端用 formatCents 换算展示。
 	// 只读：余额的变动一律走 /api/admin/users/{id}/balance，那里会写审计流水。
 	BalanceCents int64  `json:"balanceCents"`
@@ -61,6 +74,12 @@ type settingsPayload struct {
 	// 待支付订单的有效期。到期后订单连同其上传文件会被后台回收，
 	// 所以它同时是「用户可以在支付页停留多久」。
 	OrderTTLMinutes *int64 `json:"orderTtlMinutes"`
+	// ── 刷卡取件 ──
+	// PullModeEnabled 与计费互斥（反方向在 PUT /api/admin/prices 里校验）。
+	PullModeEnabled *bool `json:"pullModeEnabled"`
+	// PullTTLHours 是「员工有多久来取纸」。它与 retention_days 是两回事：
+	// 后者按打印记录的时间删文件，前者按取件时限。
+	PullTTLHours *int64 `json:"pullTtlHours"`
 }
 
 // customCSSMaxLen 是自定义 CSS 的字节上限（32 KiB）。
@@ -71,7 +90,9 @@ const customCSSMaxLen = 32 * 1024
 func adminListUsersHandler(w http.ResponseWriter, r *http.Request) {
 	var resp []adminUserResponse
 	err := appStore.WithTx(r.Context(), true, func(tx *sql.Tx) error {
-		users, err := store.ListUsers(r.Context(), tx)
+		users, err := store.ListUsers(r.Context(), tx, store.UserFilter{
+			Username: strings.TrimSpace(r.URL.Query().Get("username")),
+		})
 		if err != nil {
 			return err
 		}
@@ -100,6 +121,13 @@ func adminCreateUserHandler(w http.ResponseWriter, r *http.Request) {
 	// 否则会与 SessionHandler 的惰性创建路径分裂成两份语义不同的 guest。
 	if strings.EqualFold(payload.Username, guestUsername) {
 		writeJSONError(w, http.StatusBadRequest, "guest 是访客模式保留账号")
+		return
+	}
+	// alipay: 前缀是支付宝授权登录自动建号的命名空间（见 loadOrCreateAlipayUser），
+	// 保留出来 —— 管理员手工建一个同前缀的账号，会让「哪些是支付宝顾客」这个
+	// 判断（以及登录接口对它的拦截）失准。
+	if strings.HasPrefix(payload.Username, alipayUsernamePrefix) {
+		writeJSONError(w, http.StatusBadRequest, "alipay: 前缀是支付宝授权登录保留的命名空间")
 		return
 	}
 	role := normalizeRole(payload.Role)
@@ -191,6 +219,13 @@ func adminUpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 		if current.Username == guestUsername {
 			return errGuestModify
 		}
+		// 与新建同一条规则：不许把账号改名【进】 alipay: 命名空间 —— 那会让一个
+		// 普通账号在管理端被误显示成"支付宝顾客"。
+		// 改出去是允许的：支付宝身份存在 alipay_open_id 列里，改名不影响登录。
+		if payload.Username != current.Username &&
+			strings.HasPrefix(payload.Username, alipayUsernamePrefix) {
+			return errAlipayNamespace
+		}
 
 		user, err := store.UpdateUser(r.Context(), tx, store.UpdateUserInput{
 			ID:           id,
@@ -218,6 +253,10 @@ func adminUpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, errGuestModify) {
 			writeJSONError(w, http.StatusBadRequest, "guest 账号由访客模式自动管理，不能编辑")
+			return
+		}
+		if errors.Is(err, errAlipayNamespace) {
+			writeJSONError(w, http.StatusBadRequest, "alipay: 前缀是支付宝授权登录保留的命名空间")
 			return
 		}
 		if errors.Is(err, sql.ErrNoRows) {
@@ -308,6 +347,8 @@ func adminGetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	var customCSS string
 	var guestMode int64
 	var orderTTLMinutes int64
+	var pullMode int64
+	var pullTTLVal int64
 	err := appStore.WithTx(r.Context(), true, func(tx *sql.Tx) error {
 		val, err := store.GetSettingInt(r.Context(), tx, store.SettingRetentionDays, 0)
 		if err != nil {
@@ -344,6 +385,18 @@ func adminGetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		orderTTLMinutes = ttl
+
+		pm, err := store.GetSettingInt(r.Context(), tx, store.SettingPullModeEnabled, 0)
+		if err != nil {
+			return err
+		}
+		pullMode = pm
+
+		pt, err := store.GetSettingInt(r.Context(), tx, store.SettingPullTTLHours, 72)
+		if err != nil {
+			return err
+		}
+		pullTTLVal = pt
 		return nil
 	})
 	if err != nil {
@@ -358,6 +411,8 @@ func adminGetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		"customCss":       customCSS,
 		"guestMode":       guestMode != 0,
 		"orderTtlMinutes": orderTTLMinutes,
+		"pullModeEnabled": pullMode != 0,
+		"pullTtlHours":    pullTTLVal,
 	})
 }
 
@@ -384,7 +439,17 @@ func publicSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		// 计费是否开启决定前端要不要展示价格 / 钱包相关 UI。
 		// 只暴露这一个布尔，不含价目明细 —— 明细只走登录后的 /api/prices。
 		"billingEnabled": billingEnabled(r.Context()),
-		"currency":       CurrencyCNY,
+		// 取件模式是否开启：前端据此决定提交走哪条路，以及把成功文案换成
+		// 「已暂存，请到打印机刷卡取件」。这两个模式互斥，不会同时为真。
+		"pullModeEnabled": pullModeEnabled(r.Context()),
+		// 取件时限（小时），用于「请在 N 小时内取件」这类提示。
+		"pullTtlHours": pullTTLHours(r.Context()),
+		// 支付宝授权登录是否可用（判据是凭据齐全，与支付方式列表同一套）。
+		// 前端据此决定登录页要不要显示「支付宝登录」按钮：没配置却显示一个
+		// 点了必然失败的按钮，比不显示更糟；反过来它也是个不用改代码、不用
+		// 重新部署前端的降级开关。
+		"alipayLogin": alipayLoginEnabled(),
+		"currency":    CurrencyCNY,
 	})
 }
 
@@ -464,6 +529,47 @@ func adminUpdateSettingsHandler(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 		}
+		if payload.PullModeEnabled != nil {
+			// ── 取件模式的三方互斥 ──
+			//
+			// 计费 / 取件 / 访客 三者都在描述「谁是这个部署的打印入口」，
+			// 两两都不兼容：
+			//   计费 × 取件：一个要求先付钱，一个压根不收费，
+			//                /api/print 同时该 403 又该暂存。
+			//   取件 × 访客：访客是所有未登录用户共用的账号，而取件模式的
+			//                全部意义就是「任务认人」—— 共用账号下所有人的
+			//                任务会混在一起，刷卡时统统打出来。
+			if *payload.PullModeEnabled {
+				billing, err := store.GetSettingInt(r.Context(), tx, store.SettingBillingEnabled, 0)
+				if err != nil {
+					return err
+				}
+				if billing != 0 {
+					return errors.New("取件模式与计费互斥，请先关闭计费")
+				}
+				guest, err := store.GetSettingInt(r.Context(), tx, store.SettingGuestMode, 0)
+				if err != nil {
+					return err
+				}
+				if guest != 0 {
+					return errors.New("取件模式与访客模式互斥，请先关闭访客模式")
+				}
+			}
+			if err := store.SetSettingInt(r.Context(), tx, store.SettingPullModeEnabled, boolToInt(*payload.PullModeEnabled)); err != nil {
+				return err
+			}
+		}
+		if payload.PullTTLHours != nil {
+			// 下界 1 小时：更短会让员工来不及走到打印机。
+			// 上界 30 天：再长就是「文件在服务器上无限期躺着」，
+			// 而这是企业文档，不是公共资源。
+			if *payload.PullTTLHours < 1 || *payload.PullTTLHours > 720 {
+				return errors.New("pullTtlHours 必须在 1 到 720 之间（小时）")
+			}
+			if err := store.SetSettingInt(r.Context(), tx, store.SettingPullTTLHours, *payload.PullTTLHours); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -510,13 +616,16 @@ func mapAdminUsers(users []store.User) []adminUserResponse {
 
 func mapAdminUser(user store.User) adminUserResponse {
 	return adminUserResponse{
-		ID:           user.ID,
-		Username:     user.Username,
-		Role:         user.Role,
-		Protected:    user.Username == "admin" || user.Username == guestUsername,
-		ContactName:  user.ContactName,
-		Phone:        user.Phone,
-		Email:        user.Email,
+		ID:          user.ID,
+		Username:    user.Username,
+		Role:        user.Role,
+		Protected:   user.Username == "admin" || user.Username == guestUsername,
+		ContactName: user.ContactName,
+		Phone:       user.Phone,
+		Email:       user.Email,
+		// 判据是【列】而不是用户名前缀：改名不该让它失去这个标记。
+		IsAlipay:     user.AlipayOpenID != "",
+		CardNo:       user.CardNo,
 		BalanceCents: user.BalanceCents,
 		CreatedAt:    user.CreatedAt,
 		UpdatedAt:    user.UpdatedAt,

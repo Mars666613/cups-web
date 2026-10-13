@@ -502,7 +502,10 @@ func canGofpdiParse(pdfPath string) (ok bool) {
 func renderPDFToImages(ctx context.Context, pdfPath string, numPages int, tmpDir string) ([]composePage, error) {
 	gsBin, err := exec.LookPath("gs")
 	if err != nil {
-		return nil, fmt.Errorf("ghostscript not found, cannot render PDF to images")
+		// ⚠️ 不要把它降级成一个普通字符串。那样 errors.Is(err, errBinaryNotInstalled)
+		// 永远为假，上层任何「缺工具 vs 文件有问题」的分层处理都失效 ——
+		// 而这两种情况的处置完全不同（装包 vs 换文件）。
+		return nil, fmt.Errorf("ghostscript %w", errBinaryNotInstalled)
 	}
 
 	log.Printf("[compose] gofpdi cannot parse %s, falling back to gs rendering (%d pages)", filepath.Base(pdfPath), numPages)

@@ -79,37 +79,39 @@ func scanScheduledPrint(sc scanner) (ScheduledPrint, error) {
 
 // InsertScheduledPrint 插入一条定时任务，返回新 ID。
 func InsertScheduledPrint(ctx context.Context, tx *sql.Tx, rec *ScheduledPrint) (int64, error) {
-	res, err := tx.ExecContext(ctx, `INSERT INTO scheduled_prints (
+	var id int64
+	err := tx.QueryRowContext(ctx, `INSERT INTO scheduled_prints (
 		user_id, name, printer_uri, filename, stored_path,
 		is_duplex, is_color, copies, orientation, paper_size, paper_type, media_source, print_scaling,
 		page_range, page_set, mirror, watermark_text, number_up, number_up_layout, page_border,
 		schedule_type, schedule_time, schedule_weekday, schedule_day,
 		run_at, next_run_at, last_run_at, last_status, last_error, enabled,
 		created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
+	RETURNING id`,
 		rec.UserID, rec.Name, rec.PrinterURI, rec.Filename, rec.StoredPath,
 		rec.IsDuplex, rec.IsColor, rec.Copies, rec.Orientation, rec.PaperSize, rec.PaperType, rec.MediaSource, rec.PrintScaling,
 		rec.PageRange, rec.PageSet, rec.Mirror, rec.WatermarkText, rec.NumberUp, rec.NumberUpLayout, rec.PageBorder,
 		rec.ScheduleType, rec.ScheduleTime, rec.ScheduleWeekday, rec.ScheduleDay,
 		rec.RunAt, rec.NextRunAt, rec.LastRunAt, rec.LastStatus, rec.LastError, rec.Enabled,
 		rec.CreatedAt, rec.UpdatedAt,
-	)
+	).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	return id, nil
 }
 
 // UpdateScheduledPrint 覆盖打印参数与调度策略。next_run_at 也一并更新，
 // 避免旧调度点仍在数据库里被扫到。
 func UpdateScheduledPrint(ctx context.Context, tx *sql.Tx, rec *ScheduledPrint) error {
 	_, err := tx.ExecContext(ctx, `UPDATE scheduled_prints SET
-		name = ?, printer_uri = ?,
-		is_duplex = ?, is_color = ?, copies = ?, orientation = ?, paper_size = ?, paper_type = ?, media_source = ?, print_scaling = ?,
-		page_range = ?, page_set = ?, mirror = ?, watermark_text = ?, number_up = ?, number_up_layout = ?, page_border = ?,
-		schedule_type = ?, schedule_time = ?, schedule_weekday = ?, schedule_day = ?,
-		run_at = ?, next_run_at = ?, enabled = ?, updated_at = ?
-		WHERE id = ?`,
+		name = $1, printer_uri = $2,
+		is_duplex = $3, is_color = $4, copies = $5, orientation = $6, paper_size = $7, paper_type = $8, media_source = $9, print_scaling = $10,
+		page_range = $11, page_set = $12, mirror = $13, watermark_text = $14, number_up = $15, number_up_layout = $16, page_border = $17,
+		schedule_type = $18, schedule_time = $19, schedule_weekday = $20, schedule_day = $21,
+		run_at = $22, next_run_at = $23, enabled = $24, updated_at = $25
+		WHERE id = $26`,
 		rec.Name, rec.PrinterURI,
 		rec.IsDuplex, rec.IsColor, rec.Copies, rec.Orientation, rec.PaperSize, rec.PaperType, rec.MediaSource, rec.PrintScaling,
 		rec.PageRange, rec.PageSet, rec.Mirror, rec.WatermarkText, rec.NumberUp, rec.NumberUpLayout, rec.PageBorder,
@@ -124,8 +126,8 @@ func UpdateScheduledPrint(ctx context.Context, tx *sql.Tx, rec *ScheduledPrint) 
 // 执行完把 enabled 置 0，作为归档；周期类型仅推进 next_run_at。
 func UpdateScheduledPrintAfterRun(ctx context.Context, tx *sql.Tx, id int64, lastRunAt, lastStatus, lastError, nextRunAt string, enabled bool) error {
 	_, err := tx.ExecContext(ctx, `UPDATE scheduled_prints SET
-		last_run_at = ?, last_status = ?, last_error = ?, next_run_at = ?, enabled = ?, updated_at = ?
-		WHERE id = ?`,
+		last_run_at = $1, last_status = $2, last_error = $3, next_run_at = $4, enabled = $5, updated_at = $6
+		WHERE id = $7`,
 		lastRunAt, lastStatus, lastError, nextRunAt, enabled, nowUTC(),
 		id,
 	)
@@ -135,7 +137,7 @@ func UpdateScheduledPrintAfterRun(ctx context.Context, tx *sql.Tx, id int64, las
 // SetScheduledPrintEnabled 只切换启用/禁用状态。禁用时保留 next_run_at，
 // 恢复启用时可以直接被调度器扫到。
 func SetScheduledPrintEnabled(ctx context.Context, tx *sql.Tx, id int64, enabled bool) error {
-	_, err := tx.ExecContext(ctx, `UPDATE scheduled_prints SET enabled = ?, updated_at = ? WHERE id = ?`,
+	_, err := tx.ExecContext(ctx, `UPDATE scheduled_prints SET enabled = $1, updated_at = $2 WHERE id = $3`,
 		enabled, nowUTC(), id,
 	)
 	return err
@@ -143,7 +145,7 @@ func SetScheduledPrintEnabled(ctx context.Context, tx *sql.Tx, id int64, enabled
 
 // DeleteScheduledPrint 删除任务；调用方需要另行处理关联文件的清理。
 func DeleteScheduledPrint(ctx context.Context, tx *sql.Tx, id int64) error {
-	res, err := tx.ExecContext(ctx, "DELETE FROM scheduled_prints WHERE id = ?", id)
+	res, err := tx.ExecContext(ctx, "DELETE FROM scheduled_prints WHERE id = $1", id)
 	if err != nil {
 		return err
 	}
@@ -159,7 +161,7 @@ func GetScheduledPrintByID(ctx context.Context, tx *sql.Tx, id int64) (Scheduled
 	row := tx.QueryRowContext(ctx, `SELECT `+scheduledPrintColumns+`
 		FROM scheduled_prints s
 		JOIN users u ON u.id = s.user_id
-		WHERE s.id = ?`, id)
+		WHERE s.id = $1`, id)
 	return scanScheduledPrint(row)
 }
 
@@ -172,9 +174,13 @@ type ScheduledPrintFilter struct {
 func ListScheduledPrints(ctx context.Context, tx *sql.Tx, filter ScheduledPrintFilter) ([]ScheduledPrint, error) {
 	args := []interface{}{}
 	conds := []string{"1=1"}
+	// 同 ListPrintRecords：追加实参与取占位符绑成一步，编号不会错位。
+	arg := func(v interface{}) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
 	if filter.Username != "" {
-		conds = append(conds, "u.username = ?")
-		args = append(args, filter.Username)
+		conds = append(conds, "u.username = "+arg(filter.Username))
 	}
 	query := fmt.Sprintf(`SELECT `+scheduledPrintColumns+`
 		FROM scheduled_prints s
@@ -204,7 +210,7 @@ func ListDueScheduledPrints(ctx context.Context, tx *sql.Tx, nowUTC string) ([]S
 	rows, err := tx.QueryContext(ctx, `SELECT `+scheduledPrintColumns+`
 		FROM scheduled_prints s
 		JOIN users u ON u.id = s.user_id
-		WHERE s.enabled = 1 AND s.next_run_at <= ?
+		WHERE s.enabled = TRUE AND s.next_run_at <= $1
 		ORDER BY s.next_run_at ASC`, nowUTC)
 	if err != nil {
 		return nil, err

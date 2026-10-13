@@ -24,9 +24,9 @@ description: cups-web 的分阶段开发流程助手。用于处理需求、Bug 
 
 | 项 | 值 |
 | --- | --- |
-| 后端 | Go 1.26，`gorilla/mux`，`modernc.org/sqlite`（纯 Go，无 CGO），`goipp` |
+| 后端 | Go 1.26，`gorilla/mux`，`pgx/v5`（走 `database/sql` 兼容层 `stdlib`），`goipp` |
 | 前端 | Vue 3.5 + Vite 7，`@nuxt/ui` v4 + Tailwind CSS v4，hash 路由 |
-| 数据库 | SQLite，WAL + foreign_keys，迁移在 `internal/store/store.go::migrate()` |
+| 数据库 | PostgreSQL，表结构在 `internal/store/schema.sql`（启动时 go:embed 整份执行，幂等） |
 | 构建 | `make all`（前端 dist → Go 二进制），Docker 五阶段构建 |
 | 入口 | `cmd/server/main.go`，路由注册在同一文件 |
 | 部署 | AIO 容器（cupsd + cups-web 同容器），`docker-compose.yml`，host 网络 |
@@ -82,12 +82,13 @@ description: cups-web 的分阶段开发流程助手。用于处理需求、Bug 
 - 期望行为和不在 scope 内的内容
 - 涉及的文件：后端（`cmd/server/*.go`、`internal/*`）、前端（`frontend/src/`）、数据库（`internal/store/`）、容器（`Dockerfile`、`entrypoint.sh`、`scripts/`）
 - API 路由和 handler 设计（如新增接口）
-- 数据库迁移（幂等 SQL + `addColumnIfMissing`，见 AGENTS.md 表结构）
+- 数据库结构（改 `internal/store/schema.sql`，幂等 SQL，见 AGENTS.md 表结构）
+- 数据库方言（`$N` 占位符 / `RETURNING id` / `TRUE`·`FALSE` / `FOR UPDATE`）
 - 前端状态、路由、组件和 UI 交互
 - 测试策略、兼容性、性能和安全（CSRF、会话、跨源防护、登录限流）
 - 需要用户决定的选项
 
-优先复用现有架构和接口。数据库改动遵守 `store.go::migrate()` 的幂等增量模式；CSRF/Session 遵守 `auth/` 包的统一签发方法，禁止手搓 `http.Cookie`。
+优先复用现有架构和接口。数据库改动改 `internal/store/schema.sql` 且必须可重复执行；CSRF/Session 遵守 `auth/` 包的统一签发方法，禁止手搓 `http.Cookie`。
 
 展示方案后暂停，等待用户确认 scope 和实现方案。未确认时只进行只读调查和方案讨论。
 
@@ -120,11 +121,11 @@ description: cups-web 的分阶段开发流程助手。用于处理需求、Bug 
 | --- | --- |
 | 逻辑正确性 | 空值、零值、负值、错误分支、边界条件 |
 | API 兼容 | 请求/响应格式、CSRF 头、Cookie 属性（Path/SameSite/Secure/MaxAge）、跨源防护 |
-| 数据库 | 迁移幂等性、WAL 模式、`foreign_keys`、`ErrNotFound` 语义 |
+| 数据库 | schema 幂等性、`$N` 占位符编号、`RETURNING id`、`FOR UPDATE` 与只读事务、`ErrNotFound` 语义 |
 | 前端副作用 | 渲染、hash 路由、事件绑定、Vite 构建分包（vue-vendor/ui-vendor/pdf-vendor） |
 | 打印流水 | 类型识别→转换→页数→IPP 提交链完整性；自定义百分比缩放 gs 参数顺序 |
 | 容器与部署 | Dockerfile 阶段、entrypoint.sh 启动顺序、卷挂载路径、驱动持久化 |
-| 性能与资源 | 高频路径、I/O、goroutine 生命周期、SQLite 连接 |
+| 性能与资源 | 高频路径、I/O、goroutine 生命周期、数据库连接数（各店之和不能超过服务端 max_connections） |
 | 死代码与类型 | 未使用变量、不可达分支、字符串/数字比较、空值处理 |
 | 回归与测试 | 相关旧功能和错误路径是否受影响 |
 

@@ -3,16 +3,55 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"math/rand"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"cups-web/internal/store"
 )
 
-// newTestEnv 建一个临时库 + 临时 uploads 目录，并把包级 uploadDir 指过去
-// （cleanupOrderArtifacts 内部会用到 uploadDir 相关的路径拼接）。
+// testSchemaDSN 建一个随机 schema 并把 search_path 指过去，返回可用的 DSN。
+//
+// 与 internal/store 里的测试同一套做法（那里是 testSchema）：需要
+// TEST_DATABASE_URL，未设置就跳过；每个测试一个独立 schema，结束 drop。
+// 两个包各自实现一份是无奈 —— 测试辅助函数没法跨包共享。
+func testSchemaDSN(t *testing.T) string {
+	t.Helper()
+	base := os.Getenv("TEST_DATABASE_URL")
+	if base == "" {
+		t.Skip("TEST_DATABASE_URL 未设置，跳过需要 PostgreSQL 的测试")
+	}
+	schema := fmt.Sprintf("m%d_%d", time.Now().UnixNano()%1e9, rand.Intn(10000))
+
+	admin, err := sql.Open("pgx", base)
+	if err != nil {
+		t.Fatalf("连接测试库失败: %v", err)
+	}
+	if _, err := admin.Exec("CREATE SCHEMA " + schema); err != nil {
+		_ = admin.Close()
+		t.Fatalf("建 schema 失败: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec("DROP SCHEMA " + schema + " CASCADE")
+		_ = admin.Close()
+	})
+
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	// 空格编成 %20，不能是 QueryEscape 默认的 '+'（pgx 会当成参数名的一部分）。
+	opt := strings.ReplaceAll(url.QueryEscape("-c search_path="+schema), "+", "%20")
+	return base + sep + "options=" + opt
+}
+
+// newTestEnv 建一个临时库（独立 schema）+ 临时 uploads 目录，并把包级 uploadDir
+// 指过去（cleanupOrderArtifacts 内部会用到 uploadDir 相关的路径拼接）。
 func newTestEnv(t *testing.T) (*store.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -20,7 +59,7 @@ func newTestEnv(t *testing.T) (*store.Store, string) {
 	if err := os.MkdirAll(uploads, 0o755); err != nil {
 		t.Fatalf("建 uploads 失败: %v", err)
 	}
-	s, err := store.Open(context.Background(), filepath.Join(dir, "test.db"))
+	s, err := store.Open(context.Background(), testSchemaDSN(t), 4)
 	if err != nil {
 		t.Fatalf("打开测试库失败: %v", err)
 	}
@@ -51,17 +90,13 @@ func insertOrder(t *testing.T, s *store.Store, userID int64, source, storedRel, 
 	t.Helper()
 	var id int64
 	err := s.WithTx(context.Background(), false, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(context.Background(), `INSERT INTO print_orders (
+		return tx.QueryRowContext(context.Background(), `INSERT INTO print_orders (
 			user_id, source, batch_id, printer_uri, filename, stored_path, print_path,
 			pages, billed_pages, status, created_at, updated_at
-		) VALUES (?, ?, 'B1', 'http://x/', 'a.pdf', ?, ?, 1, 1, ?, ?, ?)`,
+		) VALUES ($1, $2, 'B1', 'http://x/', 'a.pdf', $3, $4, 1, 1, $5, $6, $7)
+		RETURNING id`,
 			userID, source, storedRel, printRel, status,
-			time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
-		if err != nil {
-			return err
-		}
-		id, err = res.LastInsertId()
-		return err
+			time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339)).Scan(&id)
 	})
 	if err != nil {
 		t.Fatalf("插订单失败: %v", err)
@@ -73,16 +108,12 @@ func insertUser(t *testing.T, s *store.Store, name string) int64 {
 	t.Helper()
 	var id int64
 	err := s.WithTx(context.Background(), false, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(context.Background(), `INSERT INTO users
+		return tx.QueryRowContext(context.Background(), `INSERT INTO users
 			(username, password_hash, role, protected, contact_name, phone, email,
 			 balance_cents, created_at, updated_at)
-			VALUES (?, 'x', 'user', 0, '', '', '', 0, ?, ?)`,
-			name, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
-		if err != nil {
-			return err
-		}
-		id, err = res.LastInsertId()
-		return err
+			VALUES ($1, 'x', 'user', false, '', '', '', 0, $2, $3)
+		RETURNING id`,
+			name, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339)).Scan(&id)
 	})
 	if err != nil {
 		t.Fatalf("插用户失败: %v", err)

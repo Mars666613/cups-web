@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // 余额变动类型。
@@ -115,12 +117,12 @@ func ApplyWalletDelta(ctx context.Context, tx *sql.Tx, in WalletDeltaInput) (int
 	var res sql.Result
 	var err error
 	if in.AmountCents < 0 {
-		res, err = tx.ExecContext(ctx, `UPDATE users SET balance_cents = balance_cents + ?
-			WHERE id = ? AND balance_cents + ? >= 0`,
-			in.AmountCents, in.UserID, in.AmountCents)
+		res, err = tx.ExecContext(ctx, `UPDATE users SET balance_cents = balance_cents + $1
+			WHERE id = $2 AND balance_cents + $1 >= 0`,
+			in.AmountCents, in.UserID)
 	} else {
-		res, err = tx.ExecContext(ctx, `UPDATE users SET balance_cents = balance_cents + ?
-			WHERE id = ?`, in.AmountCents, in.UserID)
+		res, err = tx.ExecContext(ctx, `UPDATE users SET balance_cents = balance_cents + $1
+			WHERE id = $2`, in.AmountCents, in.UserID)
 	}
 	if err != nil {
 		return 0, err
@@ -139,14 +141,14 @@ func ApplyWalletDelta(ctx context.Context, tx *sql.Tx, in WalletDeltaInput) (int
 
 	var balanceAfter int64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT balance_cents FROM users WHERE id = ?`, in.UserID).Scan(&balanceAfter); err != nil {
+		`SELECT balance_cents FROM users WHERE id = $1`, in.UserID).Scan(&balanceAfter); err != nil {
 		return 0, err
 	}
 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO wallet_transactions (
 		user_id, kind, amount_cents, balance_after_cents, order_id, payment_id,
 		idempotency_key, operator, note, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		in.UserID, in.Kind, in.AmountCents, balanceAfter,
 		nullID(in.OrderID), nullID(in.PaymentID),
 		in.IdempotencyKey, in.Operator, in.Note, nowUTC(),
@@ -163,7 +165,7 @@ func ApplyWalletDelta(ctx context.Context, tx *sql.Tx, in WalletDeltaInput) (int
 func GetBalance(ctx context.Context, tx *sql.Tx, userID int64) (int64, error) {
 	var balance int64
 	err := tx.QueryRowContext(ctx,
-		`SELECT balance_cents FROM users WHERE id = ?`, userID).Scan(&balance)
+		`SELECT balance_cents FROM users WHERE id = $1`, userID).Scan(&balance)
 	return balance, err
 }
 
@@ -173,7 +175,7 @@ func GetBalance(ctx context.Context, tx *sql.Tx, userID int64) (int64, error) {
 func HasWalletTransactions(ctx context.Context, tx *sql.Tx, userID int64) (bool, error) {
 	var count int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(1) FROM wallet_transactions WHERE user_id = ?`, userID).Scan(&count); err != nil {
+		`SELECT COUNT(1) FROM wallet_transactions WHERE user_id = $1`, userID).Scan(&count); err != nil {
 		return false, err
 	}
 	return count > 0, nil
@@ -220,21 +222,22 @@ type WalletFilter struct {
 func ListWalletTransactions(ctx context.Context, tx *sql.Tx, filter WalletFilter) ([]WalletTransaction, error) {
 	args := []interface{}{}
 	conds := []string{"1=1"}
+	// 同 ListPrintRecords：追加实参与取占位符绑成一步。
+	arg := func(v interface{}) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
 	if filter.Username != "" {
-		conds = append(conds, "u.username = ?")
-		args = append(args, filter.Username)
+		conds = append(conds, "u.username = "+arg(filter.Username))
 	}
 	if filter.Kind != "" {
-		conds = append(conds, "w.kind = ?")
-		args = append(args, filter.Kind)
+		conds = append(conds, "w.kind = "+arg(filter.Kind))
 	}
 	if filter.StartAt != "" {
-		conds = append(conds, "w.created_at >= ?")
-		args = append(args, filter.StartAt)
+		conds = append(conds, "w.created_at >= "+arg(filter.StartAt))
 	}
 	if filter.EndAt != "" {
-		conds = append(conds, "w.created_at <= ?")
-		args = append(args, filter.EndAt)
+		conds = append(conds, "w.created_at <= "+arg(filter.EndAt))
 	}
 	query := fmt.Sprintf(`SELECT `+walletTransactionColumns+`
 		FROM wallet_transactions w
@@ -242,8 +245,7 @@ func ListWalletTransactions(ctx context.Context, tx *sql.Tx, filter WalletFilter
 		WHERE %s
 		ORDER BY w.created_at DESC, w.id DESC`, strings.Join(conds, " AND "))
 	if filter.Limit > 0 {
-		query += " LIMIT ?"
-		args = append(args, filter.Limit)
+		query += " LIMIT " + arg(filter.Limit)
 	}
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -276,13 +278,23 @@ func nullID(id int64) interface{} {
 	return id
 }
 
-// isUniqueViolation 判断错误是否来自 UNIQUE 索引冲突。
-// modernc.org/sqlite 的错误文本形如：
+// isUniqueViolation 判断错误是否来自唯一约束冲突。
 //
-//	constraint failed: UNIQUE constraint failed: wallet_transactions.idempotency_key (2067)
+// 🚫 必须按 SQLSTATE 判断，不能匹配错误文本。
 //
-// 这里用字符串匹配而不是错误码，与 migrate() 里 addColumnIfMissing 识别
-// "duplicate column name" 的做法一致。
+// 原先是 `strings.Contains(err.Error(), "UNIQUE constraint failed")` —— 那是
+// SQLite 的措辞。PostgreSQL 报的是 `duplicate key value violates unique
+// constraint "..."`，文本完全不同，字符串匹配会**永远返回 false**。
+//
+// 后果不是双花（INSERT 本身照样失败、不会写出重复行），而是调用方
+// ApplyWalletDelta 拿不到 ErrDuplicateTransaction，把「重复入账、应当忽略」
+// 当成真失败 → 整笔事务回滚。而这一层正是 settlePayment 五层幂等里的第三层，
+// 于是：退款会因为 refund:<order_id> 键已存在而反复整笔回滚（订单永远停在
+// printing，每 30 秒重试一次，失败状态还从不落库）；充值结算回滚导致渠道
+// 回调一直收到 5xx 而无限重投。
+//
+// 23505 = unique_violation。
 func isUniqueViolation(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

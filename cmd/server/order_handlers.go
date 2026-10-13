@@ -48,10 +48,14 @@ func newBatchID() string {
 // ─── 下单 ─────────────────────────────────────────────────────────────
 
 type orderResponse struct {
-	OrderID        int64  `json:"orderId"`
-	BatchID        string `json:"batchId"`
-	Username       string `json:"username,omitempty"`
-	Filename       string `json:"filename"`
+	OrderID  int64  `json:"orderId"`
+	BatchID  string `json:"batchId"`
+	Username string `json:"username,omitempty"`
+	Filename string `json:"filename"`
+	// PrinterURI 是这台打印机的队列地址。刷卡取件的「待取件」提示页要靠它
+	// 告诉员工「去哪台取」—— 少了它，那个页面只能说「去打印机那儿」，
+	// 而现场通常不止一台。
+	PrinterURI     string `json:"printerUri"`
 	Status         string `json:"status"`
 	Pages          int    `json:"pages"`
 	BilledPages    int    `json:"billedPages"`
@@ -73,6 +77,7 @@ func mapOrder(o store.PrintOrder, matched bool) orderResponse {
 		BatchID:        o.BatchID,
 		Username:       o.Username,
 		Filename:       o.Filename,
+		PrinterURI:     o.PrinterURI,
 		Status:         o.Status,
 		Pages:          o.Pages,
 		BilledPages:    o.BilledPages,
@@ -103,6 +108,13 @@ type orderBatchResponse struct {
 	// Failed 列出转换失败的条目。部分失败不影响其余订单 —— 用户不该因为
 	// 一个坏文件把整批重传一遍。
 	Failed []orderFailedItem `json:"failed"`
+	// Held 为真表示这是一批【刷卡取件】的任务：已暂存，等员工刷卡才出纸。
+	//
+	// 前端靠它把「已提交打印」换成「已暂存，请到打印机刷卡取件」。
+	// 重打那条路也共用这个响应体（见 order_reprint.go），所以它才能
+	// 「不用为取件模式写一套独立响应」—— 与 handleReprint 现有的
+	// 「靠响应形状分流」约定一致。
+	Held bool `json:"held,omitempty"`
 }
 
 type orderFailedItem struct {
@@ -252,9 +264,15 @@ type multipartFile = interface {
 // 把它单独拎出来而不是给 createOneOrder 加三个散参数：那三个字段永远一起出现，
 // 而且新增来源（比如将来的「邮件打印」）时只改这里。
 type orderOrigin struct {
-	Source      string // store.OrderSourceWeb / Reprint / Scheduled
+	Source      string // store.OrderSourceWeb / Reprint / Scheduled / Pull
 	ReprintOf   int64  // 重打来源 print_jobs.id，0 表示非重打
 	ScheduledID int64  // 定时任务 id，0 表示非定时
+	// Hold 表示这是一条【刷卡取件】的订单：不收费，落库时进 held 状态
+	// （待取件）而不是 pending_payment，刷卡才送印。
+	//
+	// 它是「计费」与「取件」两种模式的唯一分叉点，所以刻意做成显式字段
+	// 而不是靠 amount==0 之类的隐式判据 —— 后者在将来加免费单时会静默走错。
+	Hold bool
 }
 
 // createOneOrder 走完整流水线并把订单落库。
@@ -267,6 +285,17 @@ func createOneOrder(ctx context.Context, userID int64, batchID string, origin or
 		return store.PrintOrder{}, 0, false, err
 	}
 
+	// 刷卡取件不收费。做法是【用空价目 + 零兜底价走同一个 Compute】，
+	// 而不是跳过它 —— Compute 顺带做了两件与钱无关、但必须做的事：
+	// 把 copies 兜底成 >= 1，以及校验页码范围（「范围内没有可打印的页面」
+	// 在取件模式下同样是错误，只是不涉及钱）。
+	//
+	// 🚫 不要用「加一条 0 元价目规则」来实现免费：那会把「不收费」表达成
+	// 一份可以改的配置，管理员哪天整理价目表把它删了，取件任务就开始收钱。
+	if origin.Hold {
+		rules, fallback = nil, 0
+	}
+
 	// ⚠️ 计费用【重排前】的页数（prepared.DocPages）。
 	// even-reverse 会补一张空白页，用 PrintPages 会多收钱。
 	quote, err := pricing.Compute(
@@ -275,6 +304,15 @@ func createOneOrder(ctx context.Context, userID int64, batchID string, origin or
 	if err != nil {
 		discardPreparedFiles(prepared)
 		return store.PrintOrder{}, 0, false, orderPricingError(err)
+	}
+
+	// 计费口径的两列在取件模式下强制归零：它们进的是营业统计，
+	// 而取件模式压根没有营业额这回事，留着非零值只会污染报表。
+	billedPages, unitCents := quote.BilledPages, quote.UnitCents
+	status := store.OrderStatusPendingPayment
+	if origin.Hold {
+		billedPages, unitCents = 0, 0
+		status = store.OrderStatusHeld
 	}
 
 	order := store.PrintOrder{
@@ -289,7 +327,7 @@ func createOneOrder(ctx context.Context, userID int64, batchID string, origin or
 		PrintPath:   prepared.PrintRel,
 		PrintMime:   prepared.PrintMime,
 		Pages:       prepared.PrintPages,
-		BilledPages: quote.BilledPages,
+		BilledPages: billedPages,
 
 		IsDuplex:        prepared.EffectiveDuplex,
 		IsColor:         form.IsColor,
@@ -309,10 +347,10 @@ func createOneOrder(ctx context.Context, userID int64, batchID string, origin or
 		NumberUpLayout:  form.NumberUpLayout,
 		PageBorder:      form.PageBorder,
 
-		UnitPriceCents: quote.UnitCents,
+		UnitPriceCents: unitCents,
 		AmountCents:    quote.AmountCents,
 
-		Status:    store.OrderStatusPendingPayment,
+		Status:    status,
 		ExpiresAt: expiresAt,
 	}
 
@@ -505,6 +543,10 @@ func buildBatchStatus(batchID string, orders []store.PrintOrder, balance int64) 
 	// 打印机出了问题，实际上只是他没付款、订单自然到期了。
 	pending, processing, printed := 0, 0, 0
 	failed, expired, cancelled := 0, 0, 0
+	// ⚠️ held（刷卡取件的待取件）必须单独计数。少了它，这些订单会掉进
+	// 下面的 default 被当成 failed —— 中间页会显示「打印失败」，
+	// 而实际上任务好好地躺在待取件里等着刷卡。
+	held := 0
 	for _, o := range orders {
 		out.Orders = append(out.Orders, mapOrder(o, true))
 		out.TotalAmountCents += o.AmountCents
@@ -513,6 +555,8 @@ func buildBatchStatus(batchID string, orders []store.PrintOrder, balance int64) 
 		switch o.Status {
 		case store.OrderStatusPendingPayment:
 			pending++
+		case store.OrderStatusHeld:
+			held++
 		case store.OrderStatusPaid, store.OrderStatusPrinting:
 			processing++
 		case store.OrderStatusPrinted:
@@ -529,6 +573,9 @@ func buildBatchStatus(batchID string, orders []store.PrintOrder, balance int64) 
 
 	notPrinted := failed + expired + cancelled
 	switch {
+	case held > 0:
+		// 还有没取走的 —— 这比其它任何状态都更该让用户看到。
+		out.Status = store.OrderStatusHeld
 	case pending > 0:
 		out.Status = store.OrderStatusPendingPayment
 	case processing > 0:

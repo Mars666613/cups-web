@@ -91,6 +91,13 @@ jobs:
         run: |
           go build -ldflags="-s -w -X main.Version=${VERSION}" -o cups-web-${{ matrix.suffix }} ./cmd/server
 
+          # 取件终端（打印机旁那台树莓派）的程序。【只在 linux 上构建】——
+          # 它读的是 Linux 的 /dev/input/event*，别的平台只有一份返回错误的桩，
+          # 打出来是个没用的二进制。
+          if [ "${GOOS}" = "linux" ]; then
+            go build -ldflags="-s -w" -o cups-kiosk-${{ matrix.suffix }} ./cmd/kiosk
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

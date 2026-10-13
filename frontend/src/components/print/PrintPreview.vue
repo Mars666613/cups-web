@@ -59,9 +59,15 @@
     <div v-else class="py-6 text-center text-xs text-muted">
       上传文件后显示预览
     </div>
-    <p v-if="pdfPreviewFailed && previewType === 'pdf'" class="mt-2 text-center text-xs text-muted">
-      PDF 预览加载失败，不影响打印，可直接点击"开始打印"。
-    </p>
+    <!-- ⚠️ 把【真实原因】一并显示出来。
+         原来只有一句「加载失败，不影响打印」，用户无法判断是文件有问题、
+         网络断了、还是浏览器不支持 —— 只能报「不能预览」，我们这边也
+         无从下手。pdf.js 的报错信息本身就说明了是缺 API、worker 起不来
+         还是文件损坏，值得占这一行。 -->
+    <div v-if="pdfPreviewFailed && previewType === 'pdf'" class="mt-2 text-center text-xs text-muted space-y-1">
+      <p>PDF 预览加载失败，不影响打印，可直接点击“开始打印”。</p>
+      <p v-if="pdfPreviewError" class="text-error break-all">原因：{{ pdfPreviewError }}</p>
+    </div>
   </UCard>
 </template>
 
@@ -113,8 +119,17 @@ function updateMobile(e) { isMobile.value = e.matches }
 
 // PDF 预览失败标记：在父组件传入新 previewUrl 时重置
 const pdfPreviewFailed = ref(false)
-function onPreviewFailed() { pdfPreviewFailed.value = true }
-watch(() => props.previewUrl, () => { pdfPreviewFailed.value = false })
+const pdfPreviewError = ref('')
+function onPreviewFailed(e) {
+  pdfPreviewFailed.value = true
+  // 保留原文而不是翻译成中文：pdf.js 的报错（缺 API、worker 加载失败、
+  // Invalid PDF structure…）本身就是诊断结论，翻译一遍反而丢掉线索。
+  pdfPreviewError.value = e?.message || String(e || '未知错误')
+}
+watch(() => props.previewUrl, () => {
+  pdfPreviewFailed.value = false
+  pdfPreviewError.value = ''
+})
 onMounted(() => {
   mediaQuery = window.matchMedia('(max-width: 639px)')
   isMobile.value = mediaQuery.matches

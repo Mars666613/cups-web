@@ -51,7 +51,7 @@
                 :class="method === m.value ? 'border-primary bg-primary/5' : 'border-default hover:bg-elevated/50'"
               >
                 <input v-model="method" type="radio" :value="m.value" class="accent-primary" />
-                <UIcon :name="m.icon" class="w-5 h-5 text-primary" />
+                <PayIcon :provider="m.value" />
                 <div class="flex-1">
                   <div class="text-sm font-medium">{{ m.label }}</div>
                   <div class="text-xs" :class="m.value === 'balance' && insufficient ? 'text-error' : 'text-muted'">
@@ -81,13 +81,14 @@
             :success-desc="printDone
               ? '打印任务已完成。'
               : '正在打印，进度可在「打印记录」中查看。'"
-            @done="close"
+            @done="onSuccessDone"
           />
 
           <!-- 已发起在线支付：等待到账（二维码 / 倒计时 / 自动刷新） -->
           <PaymentPanel
             v-else-if="!done && onlineCred"
             :cred="onlineCred"
+            :provider="method"
             :busy="paying"
             :refreshing="refreshingQr"
             :error="qrError"
@@ -137,9 +138,10 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { apiFetch, readError, readJSON } from '../../utils/api'
-import { formatCents } from '../../utils/format'
+import { formatCents, orderStatusColor as statusColor, orderStatusText as statusText } from '../../utils/format'
 import { payChannel } from '../../utils/device'
 import PaymentPanel from '../PaymentPanel.vue'
+import PayIcon from '../PayIcon.vue'
 
 const props = defineProps({
   // 下单响应：{ batchId, orders, totalAmountCents, balanceCents, expiresAt }
@@ -149,7 +151,7 @@ const props = defineProps({
 })
 
 const open = defineModel('open', { type: Boolean, default: false })
-const emit = defineEmits(['paid', 'go-wallet'])
+const emit = defineEmits(['paid', 'go-wallet', 'done'])
 
 const toast = useToast()
 const route = useRoute()
@@ -226,24 +228,16 @@ const providerLabels = {
   alipay: '支付宝',
   wechat: '微信支付'
 }
-const providerIcons = {
-  mock: 'i-lucide-flask-conical',
-  alipay: 'i-lucide-smartphone',
-  wechat: 'i-lucide-message-circle'
-}
-
 const methodOptions = computed(() => {
   const opts = [{
     value: 'balance',
     label: '余额支付',
-    icon: 'i-lucide-wallet',
     hint: `当前余额 ${formatCents(balanceCents.value)}`
   }]
   for (const m of props.paymentMethods) {
     opts.push({
       value: m,
       label: providerLabels[m] || m,
-      icon: providerIcons[m] || 'i-lucide-credit-card',
       hint: '跳转渠道完成支付，到账后自动开始打印'
     })
   }
@@ -277,7 +271,12 @@ const TERMINAL = ['printed', 'partial', 'failed', 'expired', 'cancelled']
 
 async function fetchStatus() {
   if (!props.batch?.batchId) return null
-  const resp = await apiFetch(`/api/orders/batch/${props.batch.batchId}`, {}, () => {})
+  // ⚠️ 不要在这里传 `() => {}` 把 401 处理关掉。
+  //
+  // 那样会话过期时轮询会一直失败下去，弹窗永远停在「支付处理中」，
+  // 每 2 秒打一发注定失败的请求，用户只能关窗重来。
+  // 交给全局兜底（utils/api.js 的 setUnauthorizedHandler）把用户送去重新登录。
+  const resp = await apiFetch(`/api/orders/batch/${props.batch.batchId}`)
   if (!resp.ok) return null
   return readJSON(resp)
 }
@@ -503,25 +502,17 @@ function close() {
   open.value = false
 }
 
-const statusColor = (s) => ({
-  pending_payment: 'warning',
-  paid: 'info',
-  printing: 'info',
-  printed: 'success',
-  failed: 'error',
-  refunded: 'neutral',
-  expired: 'neutral',
-  cancelled: 'neutral'
-}[s] || 'neutral')
+// 成功页结束（5 秒倒计时走完，或用户点了「返回」）。
+//
+// ⚠️ 与 close() 分开，不要合并：close() 还被「完成」按钮（打印失败那条分支）
+// 和取消流程调用，那些情况不该进中间页。只有成功页结束才 emit('done')，
+// 由父组件带用户去中间页收尾。
+function onSuccessDone() {
+  close()
+  emit('done')
+}
 
-const statusText = (s) => ({
-  pending_payment: '待支付',
-  paid: '已支付',
-  printing: '打印中',
-  printed: '已打印',
-  failed: '失败',
-  refunded: '已退款',
-  expired: '已过期',
-  cancelled: '已取消'
-}[s] || s)
+// 订单状态的文案与配色统一放在 utils/format（orderStatus*）：
+// 中间页 ResultView 也要用同一份，各写一份的话用户可见文案迟早漂。
+// ⚠️ 别改用 statusColor/statusText —— 那两个映射的是【打印记录】的状态。
 </script>

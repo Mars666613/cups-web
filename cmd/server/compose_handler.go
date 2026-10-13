@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"mime/multipart"
 	"net/http"
 )
@@ -55,7 +56,14 @@ func composeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "compose failed: "+err.Error())
+		// 缺 gs 是【服务器配置问题】，不是用户的文件有问题 —— 状态码与文案
+		// 都要区分开，否则用户会拿别的文件反复重试。
+		if errors.Is(err, errBinaryNotInstalled) {
+			writeJSONError(w, http.StatusInternalServerError,
+				"服务器未安装 Ghostscript，无法完成拼版。请联系管理员安装 ghostscript。")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "拼版失败："+err.Error())
 		return
 	}
 	defer cleanup()

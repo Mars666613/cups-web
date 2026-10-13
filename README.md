@@ -18,7 +18,7 @@
 [![Nuxt UI](https://img.shields.io/badge/Nuxt%20UI-v4-00DC82?style=flat-square&logo=nuxt.js)](https://ui.nuxt.com)
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind-v4-38B2AC?style=flat-square&logo=tailwind-css)](https://tailwindcss.com)
 [![CUPS](https://img.shields.io/badge/CUPS-IPP-orange?style=flat-square)](https://www.cups.org)
-[![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?style=flat-square&logo=sqlite)](https://www.sqlite.org)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?style=flat-square&logo=postgresql)](https://www.postgresql.org)
 
 🏠 [GitHub](https://github.com/hanxi/cups-web) • 🐳 [Docker Hub](https://hub.docker.com/r/hanxi/cups-web) • 📖 [开发文档](AGENTS.md) • 💬 [微信群](https://github.com/hanxi/cups-web/issues/36)
 
@@ -159,7 +159,7 @@ docker exec cups driver-remove canon-ufr2
 
 ## 🛠️ 技术栈
 
-- **后端**：Go 1.26 · Gorilla Mux · SQLite（`modernc.org/sqlite`，纯 Go 实现，无需 CGO）
+- **后端**：Go 1.26 · Gorilla Mux · PostgreSQL（`pgx/v5` 的 `database/sql` 兼容层）
 - **打印协议**：[OpenPrinting/goipp](https://github.com/OpenPrinting/goipp)（IPP）
 - **前端**：Vue 3 · Vite 7 · [Nuxt UI v4](https://ui.nuxt.com/) · Tailwind CSS v4 · Vue Router（hash 模式）
 - **文档转换**：LibreOffice（Office → PDF）· [ofdrw](https://github.com/ofdrw/ofdrw)（OFD → PDF，Java 21）
@@ -203,7 +203,6 @@ services:
       - LISTEN_ADDR=${LISTEN_ADDR:-:1180}
     volumes:
       - ./.etc:/etc/cups
-      - ./.data:/data
       - ./.uploads:/uploads
       - ./.drivers:/opt/cups-drivers/data
       - /dev/bus/usb:/dev/bus/usb
@@ -309,7 +308,7 @@ chmod +x cups-web-linux-amd64
 
 ```bash
 export CUPS_HOST=localhost:631
-export DB_PATH=./data/cups-web.db
+export DATABASE_URL='postgres://cupsweb:密码@127.0.0.1:5432/cupsweb?sslmode=disable'
 export UPLOAD_DIR=./uploads
 export LISTEN_ADDR=:8080
 
@@ -337,7 +336,8 @@ export LISTEN_ADDR=:8080
 | 变量名 | 说明 | 默认值 |
 | --- | --- | --- |
 | `LISTEN_ADDR` | Web 服务监听地址 | `:8080` |
-| `DB_PATH` | SQLite 数据库路径 | `data/cups-web.db` |
+| `DATABASE_URL` | PostgreSQL 连接串，**必填**（没有 SQLite 回退） | 无 |
+| `DB_MAX_CONNS` | 每个实例向数据库开多少条连接。所有实例加起来不能超过服务端 `max_connections` | `10` |
 | `UPLOAD_DIR` | 上传文件目录 | `uploads` |
 | `CUPS_HOST` | CUPS 服务地址（Docker 内默认 `localhost`） | `localhost` |
 | `CUPSADMIN` | CUPS 管理员用户名 | `print` |
@@ -349,9 +349,13 @@ export LISTEN_ADDR=:8080
 | `PRINTER_BLOCK_PRIVATE` | `true` 时拒绝指向私网地址的打印机 URI | `false` |
 | `OFD_CONVERTER_JAR` | OFD → PDF 转换器 jar 路径 | `/ofd-converter.jar` |
 
-> 💡 `.env.example` 只列了 Docker 部署常用的三个：`CUPSADMIN` / `CUPSPASSWORD` / `TZ`。这三个在镜像里都已有内置默认值（`print` / `print` / `Asia/Shanghai`），不写 `.env` 也能启动。
+> 💡 `.env.example` 里带注释的是数据库与支付宝配置。`CUPSADMIN` / `CUPSPASSWORD` / `TZ` 在镜像里都已有内置默认值，不写也能启动。
 >
-> 💡 `DB_PATH` / `UPLOAD_DIR` 的默认值是**相对路径**，镜像内工作目录是 `/`，所以容器里实际落在 `/data/cups-web.db` 与 `/uploads/`，正好对应下面的卷映射，通常不需要显式设置。
+> ⚠️ **`DATABASE_URL` 是必填的** —— 数据库已改为外部的 PostgreSQL，程序不再自带 SQLite。没配这一项容器会直接启动失败并在日志里打印格式示例。
+>
+> 💡 **建库时要指定 `C` collation**：`CREATE DATABASE cupsweb LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0;`。不指定的话，若集群默认是 ICU 非确定性 collation，用户名会变成大小写不敏感（能用 `ADMIN` 登录）。表结构不用手动建，程序启动时会自动执行。
+>
+> 💡 `UPLOAD_DIR` 的默认值是**相对路径**，镜像内工作目录是 `/`，所以容器里实际落在 `/uploads/`，正好对应下面的卷映射，通常不需要显式设置。
 >
 > 💡 `CUPS_HOST` 单容器化后默认就是 `localhost`（cupsd 与 Web 同容器），一般无需设置；只有把 Web 指向**另一台机器**上的 CUPS 时才需要，可写 `host` 或 `host:port`（省略端口时自动补 `631`）。
 >
@@ -377,9 +381,13 @@ Docker 默认卷映射：
 | 宿主机路径 | 容器路径 | 说明 |
 | --- | --- | --- |
 | `./.etc` | `/etc/cups` | CUPS 配置（打印机、PPD 等） |
-| `./.data` | `/data` | cups-web 数据库 |
 | `./.uploads` | `/uploads` | 上传的原始文件与转换后 PDF |
 | `./.drivers` | `/opt/cups-drivers/data` | 手动安装的打印机驱动快照（⚠️ 删除即丢失全部手动装的驱动） |
+
+> ⚠️ **数据库不在容器里。** 自 v0.2.15 起改为连接外部 PostgreSQL（`DATABASE_URL`），
+> 原先的 `./.data:/data` 卷已删除 —— 容器里不再有任何东西写 `/data`。
+> 宿主机上的 `./.data` 目录可以留着不管（里面只有旧的 `cups-web.db`），
+> 确认不需要回滚之后再删。
 
 此外还有两个**非数据类**的挂载，用于 USB 打印机识别与热插拔：
 
@@ -483,12 +491,16 @@ server {
 
 ### 数据备份
 
+数据库现在是**外部 PostgreSQL**，用 `pg_dump` 备份，不再有可以 `cp` 的库文件：
+
 ```bash
-cp ./.data/cups-web.db /backup/location/
-tar -czf uploads-backup.tar.gz ./.uploads/
-tar -czf cups-config-backup.tar.gz ./.etc/
-tar -czf drivers-backup.tar.gz ./.drivers/
+pg_dump "$DATABASE_URL" -Fc -f cupsweb-$(date +%F).dump     # 数据库
+tar -czf uploads-backup.tar.gz ./.uploads/                   # 上传的文件
+tar -czf cups-config-backup.tar.gz ./.etc/                   # CUPS 配置
+tar -czf drivers-backup.tar.gz ./.drivers/                   # 驱动快照
 ```
+
+> ⚠️ **上传的文件仍在本机**，不在数据库里 —— 只备份数据库的话，历史订单的原始文件与转换后的 PDF 会丢。两边都要备。
 
 > 💡 `.drivers` 一定要一起备份——它是所有手动安装的第三方驱动的唯一副本。注意它是**按架构**快照的：把 amd64 上备份的 `.drivers` 恢复到 arm64 机器上，驱动列表会提示「安装于 amd64，与当前架构不符，建议卸载重装」。
 
@@ -498,13 +510,20 @@ tar -czf drivers-backup.tar.gz ./.drivers/
 
 ### 忘记管理员密码怎么办？
 
-删除数据库文件后重启即可重置为默认 `admin/admin`（**会丢失全部数据**）：
+以前的办法是删掉 SQLite 文件让程序重建默认账号 —— 数据库搬到 PostgreSQL 之后那个办法没有了（删库可不是删一个文件那么轻）。用 SQL 直接重置该账号的密码哈希：
 
 ```bash
-docker compose down
-rm ./.data/cups-web.db
-docker compose up -d
+# 1. 生成一个 bcrypt 哈希（把 你的新密码 换掉）
+htpasswd -bnBC 10 "" '你的新密码' | tr -d ':\n' | sed 's/^\$2y\$/\$2a\$/'
+
+# 2. 写进数据库
+psql "$DATABASE_URL" -c \
+  "UPDATE users SET password_hash='<上一步的输出>' WHERE username='admin';"
 ```
+
+> 💡 `$2y$` 要改成 `$2a$`：Go 的 bcrypt 只认 `$2a$`，而 `htpasswd` 输出 `$2y$`，两者哈希算法一致、只是前缀不同。
+>
+> ⚠️ `admin` 是受保护账号，不能删也不能改名，但**可以改密码**（走管理界面或上面这条 SQL 都行）。
 
 ### Web 端看不到打印机？
 

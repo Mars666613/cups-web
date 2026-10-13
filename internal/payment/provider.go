@@ -17,6 +17,11 @@ import (
 
 var (
 	// ErrNotSupported 该渠道不支持这个操作。
+	//
+	// ⚠️ 目前【没有任何实现返回它】—— 全仓库只有这一处定义和 mock.go 里
+	// 一句提到它的注释。留着是因为「渠道不支持某操作」确实是个真实情形
+	// （比如没有退款能力的渠道），但接入新渠道时先决定它的去向：要么真有
+	// 渠道用它，要么删掉。别让它和将来新加的哨兵语义打架。
 	ErrNotSupported = errors.New("payment: operation not supported")
 	// ErrUnavailable 渠道未配置（缺密钥、未启用）。
 	ErrUnavailable = errors.New("payment: provider unavailable")
@@ -37,9 +42,9 @@ type Request struct {
 
 	// Channel 是【用户当下拿的是什么设备】，决定同一渠道用哪种收款方式。
 	//
-	// ⚠️ 这不是「渠道」（渠道是 alipay/wechat），而是渠道内部的两种形态：
-	//   手机 → 跳收银台（收银台会自动唤起 App，付完支付宝把人送回来）
-	//   电脑 → 给二维码（电脑上没装支付宝，只能让手机来扫）
+	// ⚠️ 这不是「渠道」（渠道是 alipay/wechat），而是渠道内部的形态：
+	//   手机 → ChannelWap   手机网站支付，跳收银台（会自动唤起 App）
+	//   电脑 → ChannelPage  电脑网站支付，跳收银台（页面上有二维码可扫）
 	//
 	// 同一个用户换个设备答案就变了，服务端没法猜，所以由前端判断后传上来。
 	// 空值按 ChannelQRCode 处理。
@@ -47,17 +52,37 @@ type Request struct {
 }
 
 // 收款方式。
+//
+// ⚠️ 这三个常量是【支付宝产品形态的词汇表】，不是通用的「收款方式」抽象 ——
+// qrcode / wap / page 分别对应支付宝的当面付预下单、手机网站支付、电脑网站支付。
+// 它之所以能当接口用，是因为目前只有一个真渠道；接入新渠道时第一个要回答的
+// 就是「这个渠道的收款方式与这三个值是不是一一对应」。
+//
+// 已知会对不上的地方：
+//   - 某种收款方式可能压根没有「回跳」概念（页面内二维码就是），
+//     而 cmd/server 有两处按这套词汇分支的逻辑默认它一定存在
+//     （createPayment 里的 wap 降级、credTTLFor 的 TTL 选择）。
+//   - 同一个渠道内换个产品形态，需要的交互就变了（跳转 vs 页内扫码 vs 拉起），
+//     这三个值未必够表达。
+//
+// 这是【接口适配】问题，不是协议问题 —— 先定产品形态，再定这套词汇要不要扩。
+// 详见 docs/wechat-pay.md。
 const (
 	// ChannelQRCode 返一串内容让【另一台设备】扫（支付宝当面付 precreate）。
-	// 电脑端的正路；手机端在拿不到回跳地址时的兜底。
+	//
+	// ⚠️ 现在【前端不会主动选它】—— 当面付是线下收银场景的产品，网页应用一般
+	// 签不下来，官方给网页应用的是下面两个「页面跳转类」产品。保留这条分支是
+	// 因为它的体验确实更好（二维码直接渲染在我们页面上，用户扫完不用跳转），
+	// 万一将来签到了当面付，把前端的 payChannel() 改一行就能切回来。
 	ChannelQRCode = "qrcode"
-	// ChannelWap 返一个收银台地址让【当前浏览器】跳过去（支付宝手机网站支付 wap.pay）。
+	// ChannelWap 返一个收银台地址让【当前浏览器】跳过去（手机网站支付 wap.pay）。
 	// 手机端的正路。
 	ChannelWap = "wap"
+	// ChannelPage 同上，走电脑网站支付（page.pay）。电脑端的正路。
+	// 用户在支付宝的收银台页面扫码（那里也支持电脑上直接登录支付），
+	// 付完由支付宝把浏览器送回 return_url。
+	ChannelPage = "page"
 )
-
-// WantsWap 判断调用方要的是不是手机收银台。
-func (r Request) WantsWap() bool { return r.Channel == ChannelWap }
 
 // Credential 是发起支付后给前端的凭据。
 type Credential struct {

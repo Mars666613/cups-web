@@ -15,7 +15,9 @@ func ensureDefaultAdmin(ctx context.Context) error {
 		user, err := store.GetUserByUsername(ctx, tx, "admin")
 		if err == nil {
 			if user.Role != store.RoleAdmin || !user.Protected {
-				if _, err := tx.ExecContext(ctx, "UPDATE users SET role = ?, protected = 1 WHERE id = ?", store.RoleAdmin, user.ID); err != nil {
+				// ⚠️ 必须写 TRUE 而不是 1：PG 的 boolean 列不能和 integer 比较，
+				// `protected = 1` 会直接报类型错误。
+				if _, err := tx.ExecContext(ctx, "UPDATE users SET role = $1, protected = TRUE WHERE id = $2", store.RoleAdmin, user.ID); err != nil {
 					return err
 				}
 			}

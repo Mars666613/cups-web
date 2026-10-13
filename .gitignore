@@ -38,6 +38,14 @@ __debug_bin*
 # Go
 vendor/
 
+# Python
+#
+# scripts/kiosk/kiosk.py 是树莓派端的取件终端程序，跑一次或导入一次就会
+# 在源码旁边生成 __pycache__/。不忽略的话它会跟着仓库走，
+# 而那是**与 Python 版本绑定的字节码**，换台机器就是一堆无用的二进制。
+__pycache__/
+*.py[cod]
+
 # Maven
 ofd-converter/target/
 

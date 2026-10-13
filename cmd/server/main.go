@@ -2,13 +2,14 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
+	"strings"
 	"time"
 
 	"cups-web/frontend"
@@ -22,6 +23,26 @@ import (
 )
 
 func main() {
+	// ⚠️ 必须在读任何配置【之前】加载 .env。
+	//
+	// .env.example 让用户把密钥写进 .env，但那个文件只有 docker compose 会读
+	// （它拿来做 ${VAR} 替换）；本地直接跑二进制时没人读，于是同一个文件在两种
+	// 运行方式下行为不一致。实测踩过：生产密钥写进 .env 了，F5 调试用的却是
+	// 别处的旧配置，请求打到沙箱网关 —— 界面上一切正常，真付款才失败。
+	//
+	// 优先级：真实环境变量 > .env（见 env_file.go）。
+	loadDotEnv(".env")
+
+	// 把支付渠道的实际落点打出来。见 alipayConfigSummary 的说明：
+	// 「以为在用生产、实际打到沙箱」这种错配，界面上完全看不出来。
+	log.Printf("[config] 支付宝: %s", alipayConfigSummary())
+	// 微信这行现在恒为「未实现」。留着是因为它回答的是「我配了微信为什么
+	// 支付方式里没有」—— 没有它，第一反应会去翻环境变量和 docker-compose。
+	log.Printf("[config] 微信支付: %s", wechatConfigSummary())
+	if paymentMockEnabled() {
+		log.Printf("[config] ⚠️ PAYMENT_MOCK 已开启：模拟支付渠道可用，生产环境不应出现这一行")
+	}
+
 	// 命令行参数优先级高于环境变量。
 	// 默认值留空以便区分"用户未指定"与"显式指定"，最终再回退到 :8080。
 	listenFlag := flag.String("addr", "", "监听地址，如 :8080 或 0.0.0.0:8080 (优先级高于 LISTEN_ADDR 环境变量)")
@@ -35,18 +56,26 @@ func main() {
 		addr = ":8080"
 	}
 
-	dbPath := os.Getenv("DB_PATH")
-	if dbPath == "" {
-		dbPath = filepath.Join("data", "cups-web.db")
-	}
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
-		log.Fatal("failed to create data dir: ", err)
+	// 数据库连接串。各店连同一台中心 PostgreSQL。
+	//
+	// ⚠️ 不要再往 DSN 上拼文件路径相关的处理：以前这里是 DB_PATH（SQLite 文件
+	// 路径），还有一句 MkdirAll(filepath.Dir(dbPath))。如果照旧套到 DSN 上，
+	// filepath.Dir("postgres://…") 会得到一个叫 `postgres:` 的目录。
+	//
+	// 🚫 也不要在 DSN 为空时回退到 SQLite —— 那套已经被彻底删除了。
+	// 配置缺失时直接在启动时报出来，比跑起来之后连不上库好查得多。
+	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	if dsn == "" {
+		log.Fatal("未配置 DATABASE_URL —— 本程序只支持 PostgreSQL，不再支持 SQLite。\n" +
+			"  例：DATABASE_URL='postgres://cupsweb:密码@中心库地址:5432/cupsweb?sslmode=require'\n" +
+			"  建表语句见 internal/store/schema.sql（启动时会自动执行，也可手动 psql -f）。")
 	}
 	var err error
-	appStore, err = store.Open(context.Background(), dbPath)
+	appStore, err = store.Open(context.Background(), dsn, dbMaxConns())
 	if err != nil {
 		log.Fatal("failed to open database: ", err)
 	}
+	log.Printf("[config] 数据库: %s  最大连接数 %d", redactDSN(dsn), dbMaxConns())
 	if err := ensureDefaultAdmin(context.Background()); err != nil {
 		log.Fatal("failed to ensure default admin: ", err)
 	}
@@ -85,6 +114,24 @@ func main() {
 	// 所以绝不能因为「看起来像自家回调」就放行。
 	api.HandleFunc("/payments/callback/{provider:[a-z]+}", paymentCallbackHandler).Methods("POST")
 
+	// 支付宝授权登录。两条都【不挂会话守卫】—— 顾客此刻还没有会话，这正是
+	// 登录的目的。跨源由全局 CrossOriginProtection 挡（它会拦跨源的 POST），
+	// 回跳参数的真伪由 state 签名 cookie 保证（见 internal/auth）。
+	//
+	// ⚠️ 必须注册在下面的 protected 子路由【之前】：那个子路由的前缀是空串。
+	api.HandleFunc("/auth/alipay/start", alipayAuthStartHandler).Methods("GET")
+	api.HandleFunc("/auth/alipay/exchange", alipayAuthExchangeHandler).Methods("POST")
+	api.HandleFunc("/auth/alipay/poll", alipayAuthPollHandler).Methods("GET")
+
+	// 刷卡取件的终端口。同样【不挂会话守卫】—— 取件端是打印机旁一台没有
+	// 屏幕、没有浏览器、没有 cookie 的树莓派，它拿的只是一张卡。
+	// 身份靠 body 里的终端 token（见 admin_kiosk_handlers.go）。
+	//
+	// ⚠️ 同样必须注册在下面的 protected 子路由【之前】（理由同上）。
+	api.HandleFunc("/kiosk/release", kioskReleaseHandler).Methods("POST")
+	// 终端的自检口：只验 token，不碰任何状态（见 kioskPingHandler 的注释）。
+	api.HandleFunc("/kiosk/ping", kioskPingHandler).Methods("POST")
+
 	protected := api.PathPrefix("").Subrouter()
 	protected.Use(middleware.RequireSession)
 	protected.Use(middleware.ValidateCSRF)
@@ -99,6 +146,11 @@ func main() {
 	protected.HandleFunc("/orders/batch/{batchId}", orderBatchStatusHandler).Methods("GET")
 	protected.HandleFunc("/orders/batch/{batchId}/pay", orderPayHandler).Methods("POST")
 	protected.HandleFunc("/orders/batch/{batchId}/cancel", orderCancelHandler).Methods("POST")
+	// 刷卡取件：提交（暂存，不打印）、查看自己的待取件、撤销。
+	// 与计费互斥，两者都关时走 /api/print（见 pullModeEnabled）。
+	protected.HandleFunc("/pull-orders", pullOrderCreateHandler).Methods("POST")
+	protected.HandleFunc("/pull-orders", pullOrderListHandler).Methods("GET")
+	protected.HandleFunc("/pull-orders/{id:[0-9]+}", pullOrderCancelHandler).Methods("DELETE")
 	// 在线支付：充值发起、查单（"我已支付"）、mock 渠道的显式支付。
 	// mock 的那条【必须】由环境变量 PAYMENT_MOCK=1 才能用，生产不会误开。
 	protected.HandleFunc("/wallet/topup", walletTopupHandler).Methods("POST")
@@ -122,7 +174,32 @@ func main() {
 			return
 		}
 
-		json.NewEncoder(w).Encode(printers)
+		// HasKiosk 只在刷卡取件模式下被前端用到：那个模式里提交页只列
+		// 【配有取件终端】的打印机 —— 员工选到没有终端的那台，任务提交后就
+		// 再也取不出来，而且没有任何报错。
+		//
+		// ⚠️ 查不到时全部下发 false（宁可界面少列），不是全部 true：
+		// 一次读库失败不该让员工把任务投进黑洞。
+		// 后端 pull_handlers.go 里还有一道同样的校验兜底。
+		kioskURIs := map[string]bool{}
+		if err := appStore.WithTx(r.Context(), true, func(tx *sql.Tx) error {
+			var e error
+			kioskURIs, e = store.PrinterURIsWithKiosk(r.Context(), tx)
+			return e
+		}); err != nil {
+			log.Printf("[printers] 查询取件终端失败（hasKiosk 全按 false）: %v", err)
+			kioskURIs = map[string]bool{}
+		}
+
+		type printerWithKiosk struct {
+			ipp.Printer
+			HasKiosk bool `json:"hasKiosk"`
+		}
+		out := make([]printerWithKiosk, 0, len(printers))
+		for _, p := range printers {
+			out = append(out, printerWithKiosk{Printer: p, HasKiosk: kioskURIs[p.URI]})
+		}
+		json.NewEncoder(w).Encode(out)
 	}).Methods("GET")
 	protected.HandleFunc("/print", printHandler).Methods("POST")
 	protected.HandleFunc("/convert", convertHandler).Methods("POST")
@@ -152,6 +229,22 @@ func main() {
 	admin.HandleFunc("/users/{id:[0-9]+}", adminDeleteUserHandler).Methods("DELETE")
 	// 手工调额 = 线下收款入账 / 纠正误扣。会写审计流水，不是直接改余额列。
 	admin.HandleFunc("/users/{id:[0-9]+}/balance", adminAdjustBalanceHandler).Methods("POST")
+	// 工牌绑定。必须是【刷卡】绑，不是手输 —— 同一张卡换个读卡器读出来
+	// 就不是同一个字符串，手输的号码和读卡器吐出来的对不上。
+	admin.HandleFunc("/users/{id:[0-9]+}/card", adminBindCardHandler).Methods("POST")
+	admin.HandleFunc("/users/{id:[0-9]+}/card", adminUnbindCardHandler).Methods("DELETE")
+	// 「点绑卡 → 到终端刷卡」：开一个短命窗口，窗口期内的那次刷卡会被绑给
+	// 指定用户（见 kiosk_handlers.go 的 tryBindCard）。
+	// 浏览器轮询 GET 拿结果 —— 读卡器在终端上，浏览器够不着它。
+	admin.HandleFunc("/users/{id:[0-9]+}/card-bind", adminCreateCardBindSessionHandler).Methods("POST")
+	admin.HandleFunc("/card-bind-sessions/{id:[0-9]+}", adminGetCardBindSessionHandler).Methods("GET")
+	admin.HandleFunc("/card-bind-sessions/{id:[0-9]+}", adminCancelCardBindSessionHandler).Methods("DELETE")
+	// 取件终端（打印机旁那台树莓派）的管理。token 由这里生成，
+	// 管理员填进 Pi 的配置文件。
+	admin.HandleFunc("/kiosk-terminals", adminListKioskTerminalsHandler).Methods("GET")
+	admin.HandleFunc("/kiosk-terminals", adminCreateKioskTerminalHandler).Methods("POST")
+	admin.HandleFunc("/kiosk-terminals/{token}", adminUpdateKioskTerminalHandler).Methods("PUT")
+	admin.HandleFunc("/kiosk-terminals/{token}", adminDeleteKioskTerminalHandler).Methods("DELETE")
 	admin.HandleFunc("/print-records", adminPrintRecordsHandler).Methods("GET")
 	admin.HandleFunc("/settings", adminGetSettingsHandler).Methods("GET")
 	admin.HandleFunc("/settings", adminUpdateSettingsHandler).Methods("PUT")

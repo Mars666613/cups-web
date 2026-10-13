@@ -22,6 +22,21 @@ import (
 // 包装函数自行决定，errors.Is 只用于识别"工具未安装"这一类型。
 var errBinaryNotInstalled = errors.New("not installed")
 
+// libreofficeBin 找出可用的 LibreOffice 可执行文件名。
+//
+// ⚠️ 不能写死 "libreoffice"：Debian/Ubuntu 的包提供的是 `libreoffice`，
+// 而 Windows 版装出来那个叫 `soffice.exe` —— 写死一个名字会让装了
+// LibreOffice 的开发机照样报「not installed」，白绕一圈。
+// 容器里两个名字都有（libreoffice 是 /usr/bin 下的包装脚本），优先用它。
+func libreofficeBin() (string, error) {
+	for _, name := range []string{"libreoffice", "soffice"} {
+		if _, err := exec.LookPath(name); err == nil {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("libreoffice %w", errBinaryNotInstalled)
+}
+
 // runLibreOfficeConvert 调用 libreoffice --headless --convert-to <filter> 做通用文档转换，
 // 返回生成的 PDF 绝对路径、清理函数与错误。filter 为空时默认使用 "pdf"。
 // infilter 不为空时，会在命令行中追加 --infilter=<infilter> 参数，用于指定输入格式
@@ -31,8 +46,9 @@ var errBinaryNotInstalled = errors.New("not installed")
 // libreoffice 不在 PATH 中时，返回的错误可被 errors.Is(err, errBinaryNotInstalled) 识别，
 // 供 PDF 标准化管线做"友好跳过"日志处理；Office 文档转换场景则正常向上报错即可。
 func runLibreOfficeConvert(ctx context.Context, inputPath string, filter string, infilter string) (string, func(), error) {
-	if _, err := exec.LookPath("libreoffice"); err != nil {
-		return "", nil, fmt.Errorf("libreoffice %w", errBinaryNotInstalled)
+	bin, err := libreofficeBin()
+	if err != nil {
+		return "", nil, err
 	}
 
 	tmpDir, err := os.MkdirTemp("", "convert-")
@@ -50,7 +66,7 @@ func runLibreOfficeConvert(ctx context.Context, inputPath string, filter string,
 		args = append(args, "--infilter="+infilter)
 	}
 	args = append(args, "--outdir", tmpDir, inputPath)
-	cmd := exec.CommandContext(ctx, "libreoffice", args...)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = append(os.Environ(), "LANG=zh_CN.UTF-8", "LC_ALL=zh_CN.UTF-8")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		cleanup()

@@ -611,6 +611,63 @@ func TestAlipayCreateWap(t *testing.T) {
 	}
 }
 
+// TestAlipayCreatePage 盯住电脑网站支付这条路。
+//
+// 与手机端同理：这是「页面跳转类」接口，服务端只拼地址、不联系支付宝，
+// 所以签名错了本机不会报错 —— 必须在这里自己验一遍。
+// 差别只在 method 与 product_code，传错会被网关直接拒。
+func TestAlipayCreatePage(t *testing.T) {
+	appPriv, alipayPriv := genKey(t), genKey(t)
+	a := newTestAlipay(t, appPriv, &alipayPriv.PublicKey, AlipayDefaultGateway)
+
+	const returnURL = "http://192.168.1.22:1180/#/print"
+	cred, err := a.Create(context.Background(), Request{
+		OutTradeNo:  "CW20260930120000ABCDEF",
+		AmountCents: 80,
+		Subject:     "打印费用",
+		Channel:     ChannelPage,
+		ReturnURL:   returnURL,
+		ExpiresAt:   time.Now().Add(15 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("Create(page) 失败: %v", err)
+	}
+	// 没有二维码内容 —— 前端据此知道「该跳转，不是该显示二维码」。
+	if cred.QRCodeText != "" {
+		t.Errorf("page 不该带二维码内容，实际 %q", cred.QRCodeText)
+	}
+
+	u, err := url.Parse(cred.PayURL)
+	if err != nil {
+		t.Fatalf("PayURL 不是合法 URL: %v", err)
+	}
+	q := u.Query()
+	if got := q.Get("method"); got != "alipay.trade.page.pay" {
+		t.Errorf("method = %q，期望 alipay.trade.page.pay", got)
+	}
+	if got := q.Get("return_url"); got != returnURL {
+		t.Errorf("return_url = %q，期望 %q", got, returnURL)
+	}
+	var biz struct {
+		ProductCode string `json:"product_code"`
+		Timeout     string `json:"timeout_express"`
+	}
+	if err := json.Unmarshal([]byte(q.Get("biz_content")), &biz); err != nil {
+		t.Fatalf("biz_content 不是合法 JSON: %v", err)
+	}
+	if biz.ProductCode != alipayPageProductCode {
+		t.Errorf("product_code = %q，期望 %q", biz.ProductCode, alipayPageProductCode)
+	}
+	// 电脑端和手机端一样有 timeout_express —— 它决定了用户在收银台上有多少时间。
+	if biz.Timeout == "" {
+		t.Error("没传 timeout_express")
+	}
+	// 与手机端同一条关键断言：签名必须验得过（本机没有别的地方能发现签名写错）。
+	if err := alipayVerify(alipaySignContent(q, true), q.Get("sign"), &appPriv.PublicKey); err != nil {
+		t.Errorf("收银台地址的签名验不过（用户在浏览器里会看到支付宝错误页）: %v", err)
+	}
+}
+
 // TestAlipayCreateWapNeedsReturnURL 盯住「没有回跳地址就别发链接出去」。
 //
 // 缺 return_url 时用户付完会停在支付宝自己的结果页上，还得自己找回我们的

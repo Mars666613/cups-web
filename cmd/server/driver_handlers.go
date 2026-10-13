@@ -448,7 +448,17 @@ func adminDetectPrintersHandler(w http.ResponseWriter, r *http.Request) {
 	output, err := exec.CommandContext(ctx, "lpinfo", args...).Output()
 	if err != nil {
 		log.Printf("[driver-detect] lpinfo %v failed: %v", args, err)
-		writeJSONError(w, http.StatusInternalServerError, "failed to detect printers")
+		// ⚠️ 必须区分「没装 lpinfo」和「lpinfo 跑了但失败」。
+		//
+		// 容器里缺 cups-client 时 err 是 exec.ErrNotFound，而光看
+		// 「failed to detect printers」会让人去查网络、查打印机电源、查防火墙 ——
+		// 真正要做的是装一个包。这正是 errBinaryNotInstalled 存在的意义。
+		if errors.Is(err, exec.ErrNotFound) {
+			writeJSONError(w, http.StatusInternalServerError,
+				"服务器未安装 lpinfo（cups-client），无法探测打印机。请联系管理员安装 cups-client。")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "探测打印机失败："+err.Error())
 		return
 	}
 

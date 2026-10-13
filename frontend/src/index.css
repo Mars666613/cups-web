@@ -1,6 +1,32 @@
 @import "tailwindcss";
 @import "@nuxt/ui";
 
+/* 关掉「水平滑动导航」——但只对其中一类浏览器有效。
+ *
+ * 现象：手机上在屏幕中间左右滑，页面跳到上一页/下一页，用户本来只是想滚动。
+ *
+ * ⚠️ 这类手势有【两种实现】，可修性完全相反，别混：
+ *
+ *   1. 浏览器把它实现成【页面过冲】（overscroll）→ 就是下面这条 CSS 管的事
+ *   2. 浏览器在【自己的 UI 外壳里】直接处理，网页从头到尾收不到事件
+ *      → 无解。CSS、preventDefault、touch-action 全部无效
+ *
+ * 实测：某 Android 手机自带浏览器是第 2 种（微信内置浏览器不复现）。
+ * 当时先按第 1 种修，加了这条 CSS，没能解决 —— 但留着它对第 1 类浏览器
+ * 仍然有效，且无副作用，所以保留。
+ *
+ * 📌 下次再遇到同类问题，先问「是哪个浏览器、换一个还复现吗」，别急着改代码。
+ *    判据：右滑能【前进】说明不是系统边缘手势（那个只有「返回」）；
+ *    换浏览器不复现 ⇒ 是那个浏览器外壳自己的问题，网页层面无解。
+ *
+ * 🚫 不要顺手给大容器加 `touch-action: pan-y` 来「彻底解决」：钱包页和
+ * 打印记录页的表格是横向可滚的（overflow-x-auto），那会把它们一起废掉。
+ */
+html,
+body {
+  overscroll-behavior-x: none;
+}
+
 .is-windows {
   --font-sans: "Noto Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
 }

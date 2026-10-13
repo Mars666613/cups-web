@@ -68,27 +68,30 @@ type PrintFilter struct {
 }
 
 func InsertPrintRecord(ctx context.Context, tx *sql.Tx, rec *PrintRecord) (int64, error) {
-	res, err := tx.ExecContext(ctx, `INSERT INTO print_jobs (
+	// RETURNING id 取代 LastInsertId（PG 没有后者）。
+	var id int64
+	err := tx.QueryRowContext(ctx, `INSERT INTO print_jobs (
 		user_id, printer_uri, filename, stored_path, pages,
 		job_id, status, is_duplex, is_color,
 		copies, orientation, paper_size, paper_type, media_source, print_scaling,
 		page_range, page_set, mirror, watermark_text, number_up, number_up_layout, page_border,
 		created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+	RETURNING id`,
 		rec.UserID, rec.PrinterURI, rec.Filename, rec.StoredPath, rec.Pages,
 		rec.JobID, rec.Status, rec.IsDuplex, rec.IsColor,
 		rec.Copies, rec.Orientation, rec.PaperSize, rec.PaperType, rec.MediaSource, rec.PrintScaling,
 		rec.PageRange, rec.PageSet, rec.Mirror, rec.WatermarkText, rec.NumberUp, rec.NumberUpLayout, rec.PageBorder,
 		rec.CreatedAt,
-	)
+	).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	return id, nil
 }
 
 func UpdatePrintStatus(ctx context.Context, tx *sql.Tx, id int64, status string, jobID string) error {
-	_, err := tx.ExecContext(ctx, "UPDATE print_jobs SET status = ?, job_id = ? WHERE id = ?", status, jobID, id)
+	_, err := tx.ExecContext(ctx, "UPDATE print_jobs SET status = $1, job_id = $2 WHERE id = $3", status, jobID, id)
 	return err
 }
 
@@ -96,24 +99,30 @@ func GetPrintRecordByID(ctx context.Context, tx *sql.Tx, id int64) (PrintRecord,
 	row := tx.QueryRowContext(ctx, `SELECT `+printRecordColumns+`
 		FROM print_jobs p
 		JOIN users u ON u.id = p.user_id
-		WHERE p.id = ?`, id)
+		WHERE p.id = $1`, id)
 	return scanPrintRecord(row)
 }
 
 func ListPrintRecords(ctx context.Context, tx *sql.Tx, filter PrintFilter) ([]PrintRecord, error) {
 	args := []interface{}{}
 	conds := []string{"1=1"}
+	// $N 必须按【实参 append 顺序】编号，而条件是可选拼上去的 ——
+	// 所以用 arg() 把「追加实参」和「拿到占位符」绑成一步，
+	// 编号就不可能和实参错位。末尾那个 LIMIT 也走同一个计数器。
+	//
+	// ⚠️ 不要退回成手写 $1/$2 再靠人肉对齐：条件一多，漏一个就静默查错数据。
+	arg := func(v interface{}) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
 	if filter.Username != "" {
-		conds = append(conds, "u.username = ?")
-		args = append(args, filter.Username)
+		conds = append(conds, "u.username = "+arg(filter.Username))
 	}
 	if filter.StartAt != "" {
-		conds = append(conds, "p.created_at >= ?")
-		args = append(args, filter.StartAt)
+		conds = append(conds, "p.created_at >= "+arg(filter.StartAt))
 	}
 	if filter.EndAt != "" {
-		conds = append(conds, "p.created_at <= ?")
-		args = append(args, filter.EndAt)
+		conds = append(conds, "p.created_at <= "+arg(filter.EndAt))
 	}
 	query := fmt.Sprintf(`SELECT `+printRecordColumns+`
 		FROM print_jobs p
@@ -121,8 +130,7 @@ func ListPrintRecords(ctx context.Context, tx *sql.Tx, filter PrintFilter) ([]Pr
 		WHERE %s
 		ORDER BY p.created_at DESC`, strings.Join(conds, " AND "))
 	if filter.Limit > 0 {
-		query += " LIMIT ?"
-		args = append(args, filter.Limit)
+		query += " LIMIT " + arg(filter.Limit)
 	}
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {

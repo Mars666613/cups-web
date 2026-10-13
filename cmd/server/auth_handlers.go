@@ -44,6 +44,22 @@ func randomToken() string {
 	return rand.Text()
 }
 
+// issueSession 签发会话 + CSRF cookie，并返回签出去的会话。
+//
+// 三个入口共用：密码登录、访客模式、支付宝授权登录。这段原先在 LoginHandler 与
+// issueGuestSessionIfEnabled 里各写了一份 —— 而「签发 cookie 的地方各写各的」
+// 正是属性漂移的温床（历史上登出路径就漏过 Secure/SameSite）。加第三个调用方
+// 时就该收口，别再复制第三份。
+func issueSession(w http.ResponseWriter, r *http.Request, user store.User) (auth.Session, error) {
+	sess := auth.Session{UserID: user.ID, Username: user.Username, Role: user.Role}
+	if err := auth.SetSession(w, r, sess); err != nil {
+		return auth.Session{}, err
+	}
+	// csrf token cookie（非 HttpOnly，前端要读出来放进 X-CSRF-Token 头）
+	http.SetCookie(w, auth.NewCSRFCookie(r, randomToken()))
+	return sess, nil
+}
+
 // LoginHandler handles POST /api/login
 func LoginHandler(w http.ResponseWriter, r *http.Request) {
 	var req loginReq
@@ -55,6 +71,13 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 	// guest 是保留账号，只能由 SessionHandler 在开启访客模式时自动登入。
 	// 用它的用户名从公开登录接口挤进来会绕过管理员对该模式的开关意图。
 	if strings.EqualFold(strings.TrimSpace(req.Username), guestUsername) {
+		writeJSONError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	// 支付宝账号同理：它们由授权登录自动创建（用户名形如 alipay:<open_id>），
+	// 密码是随机哈希，本来也登不进来 —— 这里显式挡掉，免得将来有人给这类账号
+	// 设了密码就多出一条绕过 OAuth 的入口。
+	if strings.HasPrefix(strings.TrimSpace(req.Username), alipayUsernamePrefix) {
 		writeJSONError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
@@ -95,13 +118,10 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	clearLoginFailures(key)
 
-	sess := auth.Session{UserID: user.ID, Username: user.Username, Role: user.Role}
-	if err := auth.SetSession(w, r, sess); err != nil {
+	if _, err := issueSession(w, r, user); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "session error")
 		return
 	}
-	// set csrf token cookie (readable by JS)
-	http.SetCookie(w, auth.NewCSRFCookie(r, randomToken()))
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -138,11 +158,10 @@ func issueGuestSessionIfEnabled(w http.ResponseWriter, r *http.Request) (auth.Se
 	if !ok {
 		return auth.Session{}, false
 	}
-	sess := auth.Session{UserID: user.ID, Username: user.Username, Role: user.Role}
-	if err := auth.SetSession(w, r, sess); err != nil {
+	sess, err := issueSession(w, r, user)
+	if err != nil {
 		return auth.Session{}, false
 	}
-	http.SetCookie(w, auth.NewCSRFCookie(r, randomToken()))
 	return sess, true
 }
 

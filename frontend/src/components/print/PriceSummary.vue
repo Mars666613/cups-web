@@ -62,7 +62,14 @@ const props = defineProps({
   // { enabled, currency, fallbackUnitCents, rules: [...] }
   prices: { type: Object, default: () => ({ rules: [], fallbackUnitCents: 0 }) },
   balanceCents: { type: Number, default: 0 },
-  pagesEstimated: { type: Boolean, default: false }
+  pagesEstimated: { type: Boolean, default: false },
+  // 价目/余额【没拉到】时的原因；非空时整块换成这句提示，不再展示金额。
+  //
+  // ⚠️ 这个 prop 以前只在模板里用、从来没声明过 —— 于是 const error 恒为
+  // undefined，那条「价目未命中」的分支永远渲染，把接口故障显示成
+  // 「该纸张组合尚未配置价目……请联系管理员配置」，让管理员去翻一份没问题的
+  // 价目表。金额宁可不显示，也不能显示成一个看起来正常的错数字。
+  error: { type: String, default: '' }
 })
 
 const emit = defineEmits(['go-wallet'])

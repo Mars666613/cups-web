@@ -113,6 +113,19 @@ func persistScheduledResult(s *store.Store, id int64, lastRunAt, lastStatus, las
 func executeScheduled(s *store.Store, uploads string, task store.ScheduledPrint) (string, error) {
 	ctx := context.Background()
 
+	// 刷卡取件模式下【拒绝】定时直印。
+	//
+	// 取件模式的全部意义是「纸只在员工刷卡时才出来」。而这个函数绕过订单链路
+	// 直接送 IPP（这条路上连计费也绕过了，见 AGENTS.md 的已知缺口），
+	// 让它在取件模式下继续跑，等于企业的保密文档会无人值守地躺在出纸口 ——
+	// 那正是拉式打印要消灭的场景。
+	//
+	// ⚠️ 如实报失败并写进 last_error，让用户在「定时打印」页看得到原因。
+	// 静默跳过会让任务看起来像跑过了，比失败更糟。
+	if pullModeEnabled(ctx) {
+		return "failed", errors.New("刷卡取件模式下不支持定时打印：任务需要到打印机旁刷工牌才会出纸")
+	}
+
 	origPath, err := os.OpenInRoot(uploads, filepath.FromSlash(task.StoredPath))
 	if err != nil {
 		return "failed", fmt.Errorf("原始文件缺失：%w", err)
