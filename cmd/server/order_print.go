@@ -550,8 +550,15 @@ func payOrdersByBalance(w http.ResponseWriter, r *http.Request, sess auth.Sessio
 		case errors.Is(err, sql.ErrNoRows):
 			writeJSONError(w, http.StatusNotFound, "order batch not found")
 		default:
+			// 原始错因只进日志。给用户（这里是掏出手机准备付钱的人）的话
+			// 必须是中文、可执行、可转述的 —— 早先这里直接把内部错误暴露成
+			// "failed to pay"，用户既看不懂，也没法向任何人描述发生了什么。
+			// 那次 PG 的「FOR UPDATE不能用于聚合函数中」就是这样被读成
+			// 「余额支付功能没做」的，实际只是一个 SQL 写错了。
+			//
+			// 「尚未扣款」是事实而非安慰：事务已整条回滚，余额与账本都没动。
 			log.Printf("[order] 余额支付失败 batch=%s: %v", batchID, err)
-			writeJSONError(w, http.StatusInternalServerError, "failed to pay")
+			writeJSONError(w, http.StatusInternalServerError, "支付失败，订单尚未扣款，请稍后重试")
 		}
 		return
 	}

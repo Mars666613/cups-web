@@ -85,13 +85,20 @@ cups-web/
 │   ├── payment_handlers.go        # settlePayment / 回调 / 查单
 │   ├── billing_handlers.go        # /api/prices、钱包
 │   ├── admin_billing_handlers.go  # 管理端价目 / 订单 / 退款 / 调额
+│   ├── admin_audit_handlers.go    # 管理操作审计（只读）
+│   ├── audit.go                   # recordAudit / 动作中文标签
+│   ├── printer_device.go          # 直连探测设备真实状态（带 5 秒缓存）
+│   ├── device_alert.go            # 设备异常巡检（每 60 秒一轮）
+│   ├── alert_notify.go            # 告警 webhook 外发（企业微信/钉钉/飞书/通用）
+│   ├── admin_device_alert_handlers.go  # 设备告警列表 / 已处理静音 / 测试通知
 │   └── version.go                 # 构建期版本号
 ├── internal/
 │   ├── auth/session.go            # securecookie 会话 + CSRF
 │   ├── pricing/                   # 计价内核（纯计算，无 DB/HTTP）
 │   ├── payment/                   # 支付渠道抽象 + mock + 支付宝（wap.pay / page.pay / 当面付）；微信未实现
+│   ├── devicealert/               # 设备异常判定（纯函数，无 DB/HTTP）
 │   ├── middleware/                 # csrf / security 中间件
-│   ├── ipp/                       # IPP 客户端 + URI 校验
+│   ├── ipp/                       # IPP 客户端 + URI 校验 + 设备直连探测
 │   ├── server/static.go           # 静态资源嵌入（SPA fallback）
 │   └── store/                     # 数据层（users / prints / settings / kiosk）
 ├── cmd/kiosk/                     # 树莓派端取件终端（evdev 读卡 + 声光反馈）
@@ -155,10 +162,25 @@ cups-web/
 | POST | `/api/pull-orders` | 刷卡取件：提交（**只暂存，不打印**） |
 | GET | `/api/pull-orders` | 刷卡取件：我的待取件任务 |
 | DELETE | `/api/pull-orders/{id}` | 刷卡取件：撤销（仅限本人、仅限 `held`） |
+| GET | `/api/copy/status?printer=<uri>` | 远程复印：eSCL 能力/状态探测（型号、ADF 双面、彩色、是否空闲、`adfLoaded`/`adfState` 进稿器装载状态）。**printer 为 CUPS 队列地址**（`/api/printers` 下发的 `uri`），后端先查 `device-uri` 得到设备地址再推导 eSCL（`ipp://host/…` → `http://host/eSCL`）；响应里的 `scanTarget` 是实际探测的 eSCL 地址，排障用。前端用 `adfLoaded` 把「放稿」默认值定到原件实际所在的位置 |
+| POST | `/api/copy` | 远程复印：body `{"printer","color","inputSource","adfDuplex","duplexOut","copies","paperSize","forceInput","forceBlank"}`。**复印 = eSCL 扫描 + IPP 打印**，扫描件是 PDF。`inputSource` 为 `platen`（玻璃板，一次一页）或 `adf`（进稿器，可多页/双面），**必须由用户显式选择**（猜错一次：玻璃板路径会得到空白页，进稿器路径会被设备终止）；玻璃板 + 双面、以及设备不支持的能力组合都会被 400 挡下。**两道闸**：下任务前进稿器若设备**明确**上报 `ScannerAdfEmpty` → 409 `{"code":"adf_empty"}`（前端提示「仍然继续」，确认后带 `forceInput:true` 重发**仅这一次**）；拿到件后若整份扫描件是空白 → 409 `{"code":"blank_scan"}`（前端带 `forceBlank:true` 才放行）。计费开启时返回待支付订单批次（与 `/api/orders` 同形状，前端复用支付弹窗）；免费/取件模式直接扫描送印。计费单的 `paperType` 固定下发 `"plain"`（价目表维度是 `(是否彩色, 纸张尺寸, 纸张类型)`，留空即 `""`，与管理员配的 `plain` 全等匹配不上，会把每一笔复印都打到兜底价）。🚫 取件模式下复印**不走暂存**——人就在打印机旁，再刷卡是重复劳动 |
+
+> 📐 **复印的扫描区域必须与原件同尺寸**（`cmd/server/copy_scan_region.go`）：设备把区域照单全收地做成 PDF 页面，若一律用设备最大幅面，A4 原件会被采成 **A3 页面**，交给 CUPS 打 A4 时 pdftopdf 会为「最适纸张」把整页 **转 90° 缩到 0.687 倍** —— 用户拿到横着且变小的复印件（实测故障）。区域因此按所选纸张算，并按通道几何区分：玻璃板平铺 = 纸张纵向（宽×高）；进稿器 = 横跨走纸方向的那条边受进稿器宽度限制（本机 RICOH Pro C5200S 装 A4 是「**长边横跨、短边走纸**」，实测扫描件里 A4 内容足迹正好 297mm×210mm，机器原稿标尺也把 A4 标在 8½ 英寸处）。纸型不认识时退回设备最大幅面（宁可多采白边，不猜着裁件）。
+
+> 📄 **「没放原件」只能看结果，不能看状态**（`cmd/server/pdf_blank.go`）：进稿器里没纸时下发 ADF 任务，设备照样 **HTTP 201 建任务并交回一张全白 PDF**（实测，非 Aborted / 非空响应），空玻璃板同理 —— 于是「扫描成功 → 落单/送印」照常走完，用户为一张白纸付钱。判据是**分块均值的覆盖率**（32×32px 块、均值 < 240 记为有内容块、整页少于 3 块算空白、边缘裁 3% 去掉走纸通道那条深色线）；**不要**改用「暗像素占比」——真机空白页 0.34% vs 真原件 0.84%，噪声与内容同量级，区分不开。实测分离度：空白页 1/7416 块、真原件 596-601 块。判不了（编码不认识 / 解析失败 / 超时）一律按「不知道」放行 —— 这是保护用户的护栏，不是收钱的闸门。
 | POST | `/api/payments/{outTradeNo}/sync` | 主动查单（「我已支付」） |
 | POST | `/api/payments/mock/{outTradeNo}/pay` | mock 渠道专用，需 `PAYMENT_MOCK=1` |
 
 > ⚠️ `/api/print` 与 `/api/orders` 是**互斥**的两条通道：计费关闭时前者可用、后者 404；开启时反之。
+
+#### `/api/printer-info` 与「只读查询的超时」
+
+- ⚠️ **只读查询（取属性 / 列队列 / 列任务）用 `queryTimeout`（5 秒），送印与任务判定用 `dialTimeout`（15 秒）。** 两者在 `internal/ipp/security.go` 里分开定义，调用点见 `client.go`。理由：15 秒是给送印定的（多页文档要过过滤器、要上传），而只读查询是几十字节的报文，cupsd 在局域网里正常 **2~14ms** 返回 —— 套 15 秒等于「一次查询卡住就让用户干等 15 秒」。
+- 实测故障：`/api/printer-info` 偶发 **502 `failed to get printer info`**，浏览器网络面板显示「TCP 连接 1ms 建好 → 一个字节都没收到 → 恰好卡满 **15.00 秒**」。那 15 秒就是 `dialTimeout`。停顿点在链路中间那一跳（开发机上 CUPS 跑在 WSL 里、Windows 经 `wslrelay` 转发；**生产是单容器，没有这一跳**）。压测 25 次顺序 + 48 并发 + 4.5 分钟真实节奏，全是毫秒级 —— 复现不出来，所以只能把「卡住时的代价」压小，不能宣称根治。
+- 只读查询**换条连接重试一次**（`doQueryRetry`，实测形态是单条连接被链路丢掉，换连接就通）。🚫 **送印绝不能重试**：超时 ≠ 没打出去，重试会真的多印一份。`GetJobState`（订单巡检判定是否已打印，结论直接关联退款）与 `CancelJob` 也刻意保持 `dialTimeout`。
+- 🚫 拿不到 `GetBody` 的请求不重试 —— 重试会发出一个**空 body**，而对端会正经回一个参数错误，看起来像「打印机不认这个请求」。
+- 🚫 被 SSRF 策略拒绝 / 拒连 / 域名解析失败这几类**不重试**：结果不会变，只会让「打印机连不上」这句话晚 5 秒说出口。
+- 前端**三处轮询都带 in-flight 守卫**（`printerInfoInFlight` / `jobsInFlight` / `copyStatusInFlight`）。⚠️ `printerInfoTimer` 是 15 秒一次，而后端卡的也是 15 秒 —— 两者相等意味着「只要卡住一次，下一次必然在它还没回来时发出」，请求会稳定堆起来（实测用户截图里同时挂着 8 条 `printer-info`）。而浏览器对同源只有 6 条并发连接，卡满之后**登录态检查、支付轮询、下单**全要排队：一次后端卡顿就变成整个页面不动。守卫只拦静默轮询，用户手点的刷新照发（点了没反应比多一条请求更糟）。
 
 #### `/api/printers` 返回形状
 
@@ -188,6 +210,10 @@ cups-web/
 | POST | `/api/admin/orders/{id}/refund` | 手工退款到余额 |
 | GET | `/api/admin/wallet-transactions` | 全站流水 |
 | GET | `/api/admin/print-records` | 全站记录 |
+| GET | `/api/admin/audit` | 管理操作审计（`?action=&page=`，只读，见下） |
+| GET | `/api/admin/device-events` | 设备异常记录（`?status=open\|resolved&page=`） |
+| POST | `/api/admin/device-events/{id}/resolve` | 标记已处理 **并静音该类**（见下） |
+| POST | `/api/admin/device-events/test` | 用当前配置发一条测试通知 |
 | GET/PUT | `/api/admin/settings` | 系统设置 |
 | POST | `/api/admin/cleanup` | 手动清理 |
 | GET | `/api/admin/drivers` | 驱动列表 + 状态 |
@@ -210,6 +236,45 @@ cups-web/
 `drivers[]` 每项是 `DriverStatus`：`name` / `displayName` / `description` / `arch` / `needCompile` / `installed` / `installedAt` / `installedArch` / `supported` / `hasScript`。`installed` 以 `manifest.txt` 是否存在为唯一判据。
 
 `customDebs[]` 每项是 `CustomDebPackage`：`filename` / `installedAt` / `installedArch` / `sizeBytes`。纯信息性条目。
+
+#### 管理操作审计（`admin_audit_log`）
+
+回答的是「计费开关、价目表、用户余额……是谁在什么时候改的、改前改后各是多少」。以前这些全都没留痕 —— 用户报「我明明充了 30 块」时，管理员只能靠 `wallet_transactions` 推，而配置类改动（计费开关、兜底单价）连推的线索都没有。
+
+- **写入侧只有 `recordAudit(ctx, tx, ...)` 一个入口**（`cmd/server/audit.go`），没有 HTTP 写接口，也不该有。调用点：用户建/改/删、余额调整、价目与计费、系统设置、订单退款、清理、取件终端建/改/删。
+- 🚫 **审计必须与业务改动同事务**：`store.InsertAudit` 收的是 `*sql.Tx` 而不是 `*sql.DB` —— 参数类型本身就是这条约定。分开写会出现「改了但没记」和「记了但没改」，两种都让审计不可信。
+- 🚫 **审计写失败要回滚整个事务**，不要为了「审计不该影响业务」去忽略错误。那等于把审计降级成建议。唯一例外是 `cleanup`：删文件不在 DB 事务里，所以它是清理完**单独事务**补记，失败时 `log.Printf` 大声报错。
+- **无变更不记**。前端每次保存都发全量表单，管理员点一次「保存」但什么都没改是常态；留空记录会把真正的那一条淹掉，而审计页的价值全在「一眼看出不一样的那条」。
+- **敏感值不进审计**：口令（只记「重置了密码」这个布尔）、取件终端 token（它等同于口令）。
+- **动作键**是点分小写（`price.update`），常量在 `internal/store/audit.go`，中文标签在 `cmd/server/audit.go` 的 `auditActionLabel` —— 两处靠同一组常量对齐。🚫 中文标签放服务端而不是前端：放前端就有两处清单，新加的动作键只会出现在其中一处，表现是审计页上冒出一行英文。
+- `before_json` / `after_json` 是 `{字段: 值}` 映射（字段名英文、稳定，可能被日志解析或脚本消费）。前端 `AdminAuditView.vue` 取两边并集渲染前后对比卡片。
+- 筛选下拉的候选项**从 `SELECT DISTINCT action` 取**，不写死 —— 动作键随功能增加，写死的下拉会漏掉新的那一类。
+- 列表是**服务端分页**（每页 100）。它是唯一一个不走 `utils/tablePage.js` 的客户端切页的管理端列表：审计只增不减，全量拉到浏览器不合适。
+
+#### 设备异常告警（`device_events`）
+
+它防的是那条最贵的故障链：**半夜卡纸 → 之后每一单都送印失败 → 自动退款 → 第二天才发现**。缺纸 / 卡纸 / 门没关 / 耗材耗尽这些信号早就在手里（`printer-state-reasons`、`marker-levels`），只是一直没人看。
+
+分层，改之前先认清自己在改哪一层：
+
+| 层 | 文件 | 职责 |
+| --- | --- | --- |
+| 判定（纯函数） | `internal/devicealert/health.go` | 一次探测结果 → 一组异常。不碰库、不发通知、不读设置 |
+| 巡检 | `cmd/server/device_alert.go` | 每 60 秒取信号 → 判定 → 去抖动 → 落库 → 决定要不要通知 |
+| 外发 | `cmd/server/alert_notify.go` | 消息文案 + 按渠道拼请求体 + 发送 |
+
+- 🚫 **别把判定逻辑写进 tick**。各家打印机报的 `printer-state-reasons` 五花八门（同一个「缺纸」四五种写法），规则一定会随型号增加 —— 放在纯函数里才能不起数据库就测一条新规则。
+- **去抖动 2 分钟**：异常必须连续两轮都看到才开事件并通知。去掉「一次网络抖动报一次」的假阳性 —— 假阳性是让人把告警整个关掉的原因。⚠️ 它**只影响开事件**，恢复是立即的。
+- ⚠️ **「问不到」不能当成「都不可达」**：`ipp.ListPrinters` 失败要整轮跳过，某一台 `GetPrinterAttributes` 失败要整台跳过（`printerSignals.Evaluated`）。把 cupsd 抽风的那一分钟当成设备故障，会给每台机器发一条假告警、再发一条假恢复。
+- **墨量只在直连探测（`Probed`）时参与判定**。cupsd 报的墨量是上一次连上时的缓存值，拿它判定会得到一条永不消失的假告警。设备探不了（`usb://` 等）时退回 `printer-state-reasons`，那至少会随作业更新。
+- ⚠️ `OpenDeviceEvent` **刷新 `updated_at` 但绝不碰 `started_at`**。刷新了的话「已持续 6 小时」永远显示「刚刚」，而那正是决定要不要现在跑去机房的数字。靠 `idx_device_events_open` 这个**部分唯一索引**（`WHERE resolved_at = ''`）保证「同一台 + 同类 + 未恢复」只有一行 —— 巡检每分钟 upsert 一次，没它一天能攒 1440 行。它也**必须是部分的**：普通唯一索引会让「上月卡纸」和「这月又卡」撞车。
+- **「已处理」= 静音该类**，不只是关掉那一条。只关的话下一轮巡检会发现原因还在、重新开一条并再通知一次，按钮的效果只维持一分钟。静音写进 `device_alert_mutes`，**解除条件是「该类别先彻底消失一次」**（巡检里用过滤前的原始观测判断）—— 这样静音不会变成「这台机器以后再也不告警」。
+- **通知失败不写 `notified_at`**，下一轮重试。这条是「webhook 地址少打一个字符」不至于静默吃掉整轮告警的全部依据。
+- ⚠️ **企业微信 / 钉钉 / 飞书失败时都可能返回 HTTP 200 + 非 0 `errcode`**。只看状态码会把「token 写错」当成发送成功。见 `alertResponseErr`；响应体解析不了则**不算失败**（自建转发常回空 body，误判成失败会 60 秒重试一次）。
+- 通知走 `ipp.NewNotifyClient`（**不是**打印机那个客户端）：它不吃 `PRINTER_HOST_ALLOWLIST` / `PRINTER_BLOCK_PRIVATE` —— 那两条是为「登录用户传入的打印机地址」设的，而告警最需要送达的恰恰是内网机器人。理由写在 `internal/ipp/security.go`。
+- **开关默认关闭**，且开启必须有通知地址（后端校验）。`alert_enabled=0` 的含义是**整个功能不做**（不巡检、不记事件、不通知），不是「只关通知」。
+- 配置（开关 / webhook / 渠道 / 重发间隔 / 耗材阈值）**放在「设备告警」子页，不放系统设置** —— 「为什么没收到消息」和「哪儿配错了」是同一个问题。「发送测试消息」用的是表单里的**当前值**（不必先保存），因为配 webhook 最容易错的就是那个 URL，得能当场验。
+- 审计里 webhook 地址**只记主机名**：机器人的密钥在路径或 query 里（`key=` / `access_token=`），完整 URL 写进审计等于把口令抄了一份到人人都能看的列表页上。
 
 ### `/api/print` 表单字段
 
@@ -242,6 +307,7 @@ PostgreSQL，连接串走 `DATABASE_URL`（**必填，没有 SQLite 回退**）�
 - 🚫 **时间列是 `TEXT` 存 RFC3339 UTC，不要改成 `timestamptz`**。UTC 的字典序等于时间序，所以排序与 `created_at < ?` 全部正确；换 `timestamptz` 要把 Go 侧 25 个时间字段改成 `time.Time`、连带约 120 处改动，而本仓库恰好有「时间差 8 小时、开发机永远复现不了」的教训。理由与代价写在 `schema.sql` 顶部。
 - 🚫 **唯一约束冲突必须按 SQLSTATE 判断**（`isUniqueViolation` 用 `pgconn.PgError.Code == "23505"`）。原先匹配 SQLite 的 `"UNIQUE constraint failed"` 文本，在 PG 下永远为假 —— 调用方拿不到 `ErrDuplicateTransaction`，会把「重复入账、应当忽略」当成真失败而整笔回滚。
 - 🚫 **`SUM(bigint)` 返回 `numeric`，必须 `::bigint`**（见 `sumPendingAmountSQL`）。扫进 `sql.NullInt64` 会失败，而那是余额支付的主路径。
+- 🚫 **`FOR UPDATE` 不能与聚合函数同现**。PG 报 `FOR UPDATE不能用于聚合函数中`，语句直接执行失败。`SumPendingAmountByBatchLocked` 因此**不能**写成 `SELECT SUM(...)::bigint ... FOR UPDATE` —— 这条 SQL 是余额支付唯一的取额入口，写错就等于**余额支付 100% 返回 500**，而在线支付（走不加锁的 `SumPendingAmountByBatch`）毫发无伤；用户看到的是一句 `failed to pay`，极易被读成「余额支付功能还没做」。锁与聚合必须分开：先 `SELECT amount_cents ... ORDER BY id FOR UPDATE` 锁住行，再在 Go 侧求和（一个批次个位数订单，逐行扫码代价可忽略）。回归守卫见 `internal/store/orders_pay_test.go`。
 - 🚫 **布尔列不能在 SQL 里跟 `1`/`0` 比**，写 `TRUE` / `FALSE`。`protected = 1` 是类型错误。
 - 🚫 **`LastInsertId` 不存在**，自增主键一律 `INSERT ... RETURNING id` + `QueryRowContext`。
 - 🚫 **`INSERT OR IGNORE/REPLACE` 不存在**。`settings` 的两处 upsert 是 `ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value` —— 写成 `DO NOTHING` 会让设置项**静默存不进去**（界面看着保存成功、刷新就回退）。
@@ -259,7 +325,7 @@ PostgreSQL，连接串走 `DATABASE_URL`（**必填，没有 SQLite 回退**）�
 | `sumPendingAmountSQL`（余额支付用的那条） | 读完成与扣款之间有人取消订单 → **按取消前的总额扣钱** |
 | `listOrderIDsByStatus` / `MarkOrdersPaidByPayment` | 返回的 id 集合与实际改到的行不一致 → 给已取消的订单送印 |
 
-- ⚠️ **`FOR UPDATE` 不能在只读事务里跑**（PG 直接报错）。所以余额支付那条合计拆成了两个函数：`SumPendingAmountByBatch`（只读，`startOnlinePayment` 用）与 `SumPendingAmountByBatchLocked`（加锁，扣款路径用）。加锁前先确认调用方是 `WithTx(..., false)`。
+- ⚠️ **`FOR UPDATE` 不能在只读事务里跑**（PG 直接报错）。所以余额支付那条合计拆成了两个函数：`SumPendingAmountByBatch`（只读，`startOnlinePayment` 用）与 `SumPendingAmountByBatchLocked`（加锁，扣款路径用）。加锁前先确认调用方是 `WithTx(..., false)`。⚠️ 加锁那版**不能再套聚合**（见上一节那条），两者只能分开做。
 - ⚠️ **多实例隐患（尚未处理）**：`userRefundLock` 是**进程内** `sync.Mutex`，而可退额度是一次非原子求和。单进程没问题，一旦跑第二个实例就会出现超额退款。真要多实例时得换成数据库层的锁或原子校验。同样地，「一个店一个实例」是当前的部署前提。
 
 ### `users`
@@ -302,7 +368,7 @@ PostgreSQL，连接串走 `DATABASE_URL`（**必填，没有 SQLite 回退**）�
 
 ### `settings`
 
-KV 表。当前键：`retention_days`（`0` = 永久）、`save_history`、`max_pages_per_job`、`max_upload_bytes`、`custom_css`、`guest_mode`、`session_hash_key` / `session_block_key`，计费相关的 `billing_enabled`（`0` 默认关闭）/ `order_ttl_minutes`（`15`）/ `price_fallback_cents`（`0`）/ `payment_methods`（空 = 不限制）/ `site_base_url`（空 = 渠道不会回调，靠主动查单），以及刷卡取件的 `pull_mode_enabled`（`0`）/ `pull_ttl_hours`（`72`）。
+KV 表。当前键：`retention_days`（`0` = 永久）、`save_history`、`max_pages_per_job`、`max_upload_bytes`、`custom_css`、`guest_mode`、`session_hash_key` / `session_block_key`，计费相关的 `billing_enabled`（`0` 默认关闭）/ `order_ttl_minutes`（`15`）/ `price_fallback_cents`（`0`）/ `payment_methods`（空 = 不限制）/ `site_base_url`（空 = 渠道不会回调，靠主动查单），刷卡取件的 `pull_mode_enabled`（`0`）/ `pull_ttl_hours`（`72`），以及设备告警的 `alert_enabled`（`0` 默认关闭）/ `alert_webhook_url`（空 = 只记事件不外发）/ `alert_webhook_kind`（`auto`）/ `alert_repeat_minutes`（`60`，`0` = 只提醒一次）/ `alert_supply_low_percent`（`10`）。
 
 > `billing_enabled` / `pull_mode_enabled` / `guest_mode` **三方两两互斥**，两个方向各校验一次（见 [刷卡取件](#-刷卡取件拉式打印)）。
 
@@ -535,7 +601,7 @@ KV 表。当前键：`retention_days`（`0` = 永久）、`save_history`、`max_
 
 实测：一台离线的打印机，cupsd 仍报 `idle`、四个墨盒 70/60/50/70、五个纸盒 —— 全是它脑子里的印象。照着这些判断，用户照样能把钱付出去。
 
-`device-uri`（如 `ipp://192.168.0.243/ipp/print`）是 cupsd 唯一给出的真实线索。`ipp.ProbeDevice` 拿它**直连设备**：
+`device-uri`（如 `ipp://192.168.1.100/ipp/print`）是 cupsd 唯一给出的真实线索。`ipp.ProbeDevice` 拿它**直连设备**：
 
 - `ipp://` `ipps://` → 发一次真正的 IPP `Get-Printer-Attributes`，拿到**打印机自报**的状态与**实时**墨量
 - `socket://` `lpd://` `http(s)://` → TCP 连一下端口
@@ -546,6 +612,7 @@ KV 表。当前键：`retention_days`（`0` = 永久）、`save_history`、`max_
 - 结果缓存 5 秒（`deviceProbeTTL`）：不可达时要等满超时，而打印页展示与下单闸门都会用到。探测本身不持锁。
 - 前端 `PrinterStatus.vue` 把「队列状态」与「设备状态」**分开显示**，不可达时顶上一条红色警告，并把墨量标成「缓存值 · 打印机离线」。
 - 🚫 别把两者合并成一个「状态」——它们回答的是两个不同的问题：「队列怎么想」与「打印机在不在」。
+- **同一份探测结果也被设备告警巡检复用**（`cmd/server/device_alert.go` 的 `evaluatePrinter`，共用 `probeDevice` 的 5 秒缓存）。那一层关心的是「有哪些异常、要不要叫人」，见上面「设备异常告警」。
 
 提交成功后订单**停在 `printing`**，由 `confirmPrintResults` / `confirmPrintResultsForBatch` 核对真实结果，`decidePrintAction` 裁决：
 
@@ -616,7 +683,7 @@ job-impressions-completed = 1                 ← 然后就再也不动了
 
 | 导航项 | 路由 | 内容 |
 | --- | --- | --- |
-| 在线打印 | `/print` | 落地页：打印机 + 四个模式按钮，选完才进具体打印界面 |
+| 在线打印 | `/print` | 落地页：打印机 + 五个模式按钮（标准/速印/发票/身份证/复印），选完才进具体打印界面 |
 | 个人中心 | `/me` | 入口列表：打印记录 / 钱包 / 定时 / 管理 / 驱动 / 登出 |
 
 另有 `/done`（**打印/支付完成后的中间页**，见 `ResultView.vue`）。它不在导航里，**两条支付路径都收敛到这里**：
@@ -634,6 +701,7 @@ job-impressions-completed = 1                 ← 然后就再也不动了
 
 - 🚫 **`statusText/statusColor`（`utils/format`）映射的是【打印记录】的状态**（`queued/printed/failed/cancelled`）；**订单**状态是另一套（`printing/refunded/expired/...`），要用 `orderStatusText/orderStatusColor`。拿错的那对去渲染订单，`printing` 会落不到映射里、被原样透出英文。实测踩过：中间页的订单标签显示成 `printing`。四个使用者（`PaymentModal` / `WalletView` / `ResultView` / `AdminOrdersView`）共用这一份，🚫 不要再各写一份。同理，订单/流水的筛选项「全部」哨兵值走 `utils/adminFilters.js` 的 `FILTER_ALL`。
 - ⚠️ **`App.vue::loadSession` 里读 `route.path` 之前必须 `await router.isReady()`。** 路由守卫里有一次异步的 session 请求，首次导航在 `onMounted` 时还没落定，此刻 `route.path` 仍是初始的 `/` —— 那个「根路径就兜底跳 /print」的判断会命中，把用户真正想去的那一页冲掉。实测：刷新 `/#/records`、`/#/wallet` 都会被送到打印页。
+- ⚠️ **顶栏「在线打印」在已处于 `/print` 时不能只靠 `router.push`。** 五个模式共用 `/print` 这一个路由（靠组件内部状态切换），用户进了「标准打印」后地址栏仍然是 `/print`，此时 `push('/print')` 是一次**重复导航**，Vue Router 直接忽略、页面一动不动 —— 用户判定「这个按钮坏了」。所以 `goPrint()` 判断已在 `/print` 时改发广播（`utils/printHomeSignal.js`），由 `PrintView` watch 它退回落地页。**凡是「多个视图共用一个路由」的地方都有这个坑**：导航按钮的语义是「回到这个区域的入口」，而路由层根本看不见这个区别。同类写法见 `utils/paymentSignal.js`。
 
 **打印页只留操作，不留历史与运维信息**：
 
@@ -649,7 +717,7 @@ job-impressions-completed = 1                 ← 然后就再也不动了
 
 #### 系统管理是「落地菜单 + 子页」，🚫 不要再堆回单页
 
-`/admin` 只是一个落地菜单（`AdminView.vue`），六个板块各是一个子路由：
+`/admin` 只是一个落地菜单（`AdminView.vue`），每个板块各是一个子路由：
 
 ```
 /admin            落地菜单（AdminView.vue）
@@ -657,16 +725,19 @@ job-impressions-completed = 1                 ← 然后就再也不动了
 /admin/records    打印记录      AdminRecordsView.vue
 /admin/orders     打印订单      AdminOrdersView.vue
 /admin/wallet     余额流水      AdminWalletView.vue
+/admin/audit      操作审计      AdminAuditView.vue
+/admin/alerts     设备告警      AdminAlertsView.vue
 /admin/billing    计费设置      AdminBillingView.vue
 /admin/kiosk      取件终端      AdminKioskView.vue
 /admin/settings   系统设置      AdminSettingsView.vue
 ```
 
-- **为什么拆**：原先六块同页，`onMounted` 会**并行拉四个「全站」列表**（用户 / 打印记录 / 订单 / 流水，后端都无上限）。拆开后每个子页只加载自己那一份，负载降到 1/4；六个子页也都改成了懒加载，管理端代码不再进首屏包。
+- **为什么拆**：原先六块同页，`onMounted` 会**并行拉四个「全站」列表**（用户 / 打印记录 / 订单 / 流水，后端都无上限）。拆开后每个子页只加载自己那一份，负载降到 1/4；各子页也都改成了懒加载，管理端代码不再进首屏包。
 - ⚠️ **子页清单只有一份**：`utils/adminSections.js` 的 `ADMIN_SECTIONS`。落地菜单与子页标签栏（`components/admin/AdminTabs.vue`）都从它取 —— 各写一份的表现是「菜单里点得到、标签栏里切不过去」。新增子页只需改这一处 + `router/index.js` 注册路由。
 - ⚠️ **`App.vue` 的 `PROFILE_PATHS` 必须保持【前缀匹配】**（`startsWith(p + '/')`）。改回 `includes(route.path)` 的精确匹配，所有 `/admin/xxx` 子页上顶栏就都不高亮了，而表现是「看起来像导航坏了」。
 - ⚠️ **子页之间不要互相重载数据**。原先「退款后顺带刷新用户与流水列表」「清理后顺带刷新打印记录」这类跨板块刷新，在拆页后指向的是没挂载的页面，必须删掉 —— 每个子页每次进入都会重新挂载并自己拉取。
 - ⚠️ 子页的 loader **失败必须有可见错误态**，且 `billing` / `settings` 两页在加载失败时要**禁用保存按钮** —— 否则表单停在初值，管理员照着「默认的」界面点保存，就把真实配置覆盖掉了。
+- 落地菜单顶部有一条**未恢复设备异常的横幅**（`AdminView.vue`，`/api/admin/device-events?status=open`）。它是唯一一个「失败时静默」的接口调用：读不到的计数不该把整个管理首页变成错误页。横幅补的是通知够不着的那一段 —— 群里的告警消息会被刷下去，横幅只要打开页面就还在。
 
 - **打印落地页是刻意的**：`PrintView.vue` 的 `entered` 为假时只渲染打印机与四个模式按钮。手机屏小，一上来就把上传区、十几个参数、预览、打印记录全堆出来，用户不知道从哪儿下手。
 - ⚠️ `entered` **不用** localStorage 里的 `print_mode` 决定 —— 每次进这个页面都先看落地页。存下来的模式只用来让 `switchMode` 在「选的还是同一个模式」时保留已填好的内容。
@@ -674,6 +745,8 @@ job-impressions-completed = 1                 ← 然后就再也不动了
 - ⚠️ **`emit('logout')` 必须接到 `logout()`，不是 `onLogout()`**：后者只清内存里的 session，服务端 cookie 还在，刷新一下又自动登回去。早先只有顶栏的登出按钮走 `logout()`，视图 emit 仅用于 401 自动登出，所以这个坑一直没露头。
 - 钱包页的**打印订单 / 余额流水默认收起**（最多 100 / 50 条，展开着要划很久），折叠写法照抄 `PrintRecordList.vue`：可点的标题 + chevron，内容是 `overflow-hidden` + `maxHeight` 过渡。
 - **管理端各子页（`views/admin/*.vue`）的表格分页**走 `utils/tablePage.js` 的 `usePagedRows`：默认 20 行，配 `UPagination`，并显示「共 N 条」。后端那几个 `/api/admin/*` 列表**没有任何上限**（`PrintFilter` 有 `Limit` 字段，但管理端 handler 不传），有多少返回多少 —— 所以前端必须自己收口。⚠️ 拆成子页只把「一次拉四个全站列表」降成了「一次拉一个」，**没有解决单表本身无上限的问题**；真到了百万行量级，得后端支持 `limit`/`offset` 才算解决。
+  - **唯一的例外是操作审计**（`AdminAuditView.vue`）：`/api/admin/audit` 是**服务端分页**（每页 100），前端不切片，直接 `UPagination` 绑页码 + `watch(page)` 重拉。审计只增不减，全量拉到浏览器不合适 —— 它是第一个真有 `limit`/`offset` 的管理端列表，可作为其余列表要加上限时的参照。
+  - ⚠️ 服务端分页那一页要多一层**请求序号**（`auditSeq`）：连点翻页时旧响应可能后到、把新一页盖回去。这与 `PrintView` 轮询用的 in-flight 计数**不是一回事** —— 那里是「同一份数据反复拉」，跳过重复请求就对；这里是「每次要不同的一页」，跳过会让用户点不动，正确做法是让最后一次赢。
   - 🚫 **不要以为给 `UTable` 传 `:pagination` 就会分页。** @nuxt/ui 4.7.1 的 `UTable` 只注册了 `getCoreRowModel` / `getFilteredRowModel` / `getSortedRowModel` / `getExpandedRowModel` —— **没有 `getPaginationRowModel`**。那个 `pagination` 属性只是状态透传（配 `onPaginationChange` 用），传进去**不会切片，表格照常渲染全部行**。看着完全正确、构建和静态检查全绿，但页面长度一点没变 —— 只有拿真数据渲染出来才看得见。要真分页就得自己 `slice`（现在的做法）。
   - ⚠️ **空表有两个方向，两个都要堵**：①重新查询时页码要归零（在第 5 页搜出 3 条 → 空白）；②数据变少时页码要往回夹（在最后一页删掉唯一一条 → 空白）。`usePagedRows` 各有一条，删任何一条都会出现「明明有数据但表格是空的」。
   - ⚠️ 归零只放在**「查询」按钮**上（`searchAdminOrders` 等独立无参函数），🚫 不要塞进 loader —— 退款/调额之后也会重跑 loader，那时用户在第 3 页操作完被弹回第 1 页很难受。也不要把这些 `search*` 写成带可选参数的（模板里 `@click` 会传 `MouseEvent`，理由见下面那条）。
@@ -690,6 +763,7 @@ job-impressions-completed = 1                 ← 然后就再也不动了
 | 用户上传的原始文件 | IndexedDB（`utils/pendingUpload.js`） | 二进制、几十 MB。localStorage 只能存字符串且 5MB 上限，一张手机照片就超 |
 
 - ⚠️ **只在确认是浏览器重载时恢复**（Navigation Timing 的 `reload` / `back_forward`）。从导航进这个页面时看到落地页是刻意的入口设计，不能被自动填上上次留下的文件。
+- ⚠️⚠️ **「只在重载时恢复」这个判据必须再加一条：本文档加载只恢复【一次】**（`reloadRestoreConsumed`，声明在 `<script setup>` 之外的模块作用域）。`navType()` 描述的是**整份文档**怎么被加载的，SPA 内部的路由跳转不会改变它 —— 所以用户只要按过一次 F5（或手机被回收后恢复过一次），此后同一份文档里**每一次**挂载 `isBrowserReload()` 都为真，恢复逻辑就一直生效。真机故障：电脑端「个人中心 → 在线打印」回不到首页（开发时总在刷新，type 常年是 reload），手机端却能（手机是导航进来，type 是 navigate）—— 同一份代码两套行为，差别只在这里。好消息是这个守卫一并挡住了文件的误恢复：`restorePendingUpload` 依赖 `restoredFromReload`，它不置真就不会去 IndexedDB 捞文件。
 - ⚠️ **恢复走同一个入口函数**（`processFile` / `processMultipleImages` / `batch` / `convertQuickText`…），不要自己去拼内部状态（`previewUrl` / `pdfBlob` / `converted` / `imageThumbnails`…）—— 那样迟早漏掉一个 ref，表现为「预览看着对但某个参数没生效」，极难查。
 - ⚠️ **不要直接把 `File` 存进 IndexedDB**：个别浏览器（尤其老 WebView）克隆回来只剩 `Blob`，`name` / `type` 丢了 —— 而 `processFile` 全靠这两个字段认文件类型。`packValue` / `unpackValue` 负责包装与还原（导出是为了能被单独验证）。
 - ⚠️ 文件集合的同步用**一条 deep watch** 覆盖全部入口，🚫 别往 `processFile` / `removeImage` / `removeInvoiceFile` 里逐个插调用 —— 漏一个的表现是「某种方式选的文件丢了」，几乎复现不出来。
@@ -824,6 +898,9 @@ held ──(刷卡，原子领取)──► printing ─┬─► printed
   - 到账后**锁定**（`paymentSettled`），后续打印结果只改文案（「支付成功」→「打印完成」），不会把已经展示的成功页翻回去。
   - 唯独打印确实失败/部分失败时不报成功 —— 那时给用户看原因与退款（`printFailed`）。
 - ⚠️ 所有会写进界面的错误提示**必须自动消失**（`flashError` / `clearTopupErrorLater`）。一句永远不走的「尚未收到支付结果」既像故障，又挡住后面的状态变化。
+- ⚠️ **余额不足只挡「余额支付」这一条路**（`confirmDisabled`）。早先的条件是 `paying || insufficient`，于是余额为 0 的账号（比如管理员本人）选中支付宝后，「确认支付」仍然是禁用的 —— 鼠标落在上面是个红色禁止标，界面上却没有一个字解释为什么，用户唯一的结论是「支付宝这条路坏了」。在线渠道根本不经过余额，禁用它是错的；同时补一条「余额不足，可直接改选在线支付」的提示，把出路写出来。
+- ⚠️ **待支付订单必须有回到付款界面的路**：`我的钱包 → 打印订单` 里 `pending_payment` 的行带「去支付」（`resumePay`），点它按 `batchId` **重新取一次**批次详情再开同一个 `PaymentModal`（列表是页面加载时的快照，可能早已过期/被别处付掉，不能拿旧数据拼）。没有这个入口，用户一旦离开支付弹窗（余额不够去充值、手滑关窗），那笔单就只剩「等 15 分钟过期作废」，而复印要重新去机器上放一次原件。该入口传 `allow-cancel=false`：这里点「取消」只关窗，不作废订单。
+- ⚠️ `PaymentModal` 在父组件里是**常驻**的（只切 `open`），所以打开时必须把 `paymentSettled` 一起复位 —— 漏了它，付完一单再开下一单，`showSuccess` 立刻为真，用户看到的是上一单的「支付成功」，连支付方式都挑不了。
 - 🚫 **公开入口函数不要带可选参数**。模板里写 `@click="startTopup"` 时 Vue 会把 `MouseEvent` 传进来，签名若是 `startTopup(silent = false)` 那事件对象就是真值，手动点击会静默退化成「自动刷新」模式。实测踩过两次。现在公开入口一律无参，静默行为拆成 `runTopup` / `runSyncTopup` 等内部函数。
 - 🚫 对渠道的**出站**调用（`Create` / `Close`）绝不挂 HTTP 请求的 ctx —— 浏览器一次中止就会掐断调用，表现为「第一次点报错、第二次成功」。用 `paymentChannelTimeout` 独立超时。
 
@@ -911,6 +988,15 @@ bash verify-alipay.sh          # 支付宝全链路（本地假网关，无需�
 `pull_mode_enabled` 默认 **0**。与 `billing_enabled`、`guest_mode` **三方两两互斥** ——
 它们回答的都是「谁是这个部署的打印入口」，互斥在 `adminUpdateSettingsHandler`
 与 `adminUpdatePricesHandler` 里**两个方向各校验一次**。
+
+> ⚠️ **管理端的两个「总开关」都是独立即时生效的，不走保存按钮**：计费开关
+> （`AdminBillingView.vue` → PUT `/api/admin/prices` 只带 `enabled`）与刷卡取件开关
+> （`AdminKioskView.vue` → PUT `/api/admin/settings` 只带 `pullModeEnabled`）。
+> 两者都必须在失败时**把开关拨回原位** —— 界面显示「已开启」而服务端没接受，
+> 管理员会以为员工的任务已经开始暂存、用户已经开始付费了，这是最不能有的错觉。
+> 之所以能只提交一个字段，是因为 `pricesPayload` 的三个字段全是**指针**（省略即不改）。
+> 价目表与兜底单价是**另一件事**（改完要点「保存价目」），所以 `savePrices` 🚫
+> **不带 `enabled`** —— 带上它会让「保存价目」顺带改写开关状态，两边打架时无从解释。
 
 **复用**「先提交、后送印」那套机器，不另起炉灶：`prepareOrderPrint` → `print_orders`
 （新状态 `held`、来源 `pull`、金额 0）→ 刷卡时 `ClaimHeldOrdersForPrinter` 原子领取 →
@@ -1132,7 +1218,7 @@ make docker-build   # AIO 镜像
 
 ### docker-compose
 
-单服务 `cups`（AIO），`image: hanxi/cups-web:latest`，`network_mode: host`（mDNS 组播需要，CUPS 直接占用宿主 `631`，Web 由 `LISTEN_ADDR` 决定、默认 `:1180`，issue #107）。
+单服务 `cups`（AIO），`image: Mars666613/cups-web:latest`，`network_mode: host`（mDNS 组播需要，CUPS 直接占用宿主 `631`，Web 由 `LISTEN_ADDR` 决定、默认 `:1180`，issue #107）。
 
 | 配置 | 为什么 |
 | --- | --- |
@@ -1161,8 +1247,8 @@ make docker-build   # AIO 镜像
 
 ### CI/CD
 
-- **`build-release.yml`**：7 平台交叉编译。v* tag → 正式 Release；master 分支 → 滚动 `dev` prerelease（git 标签 `dev`，不用分支名，避免重名冲突）
-- **`docker-publish.yml`**：`master` / `v*` tag → 三架构镜像。v* tag → `vX.Y.Z` + `latest`；master 分支 → `dev`（`VERSION` 同步）。开头有 `Free disk space` 步骤。
+- **`build-release.yml`**：7 平台交叉编译。v* tag → 正式 Release；main 分支 → 滚动 `dev` prerelease（git 标签 `dev`，不用分支名，避免重名冲突）
+- **`docker-publish.yml`**：`main` / `v*` tag → 三架构镜像。v* tag → `vX.Y.Z` + `latest`；main 分支 → `dev`（`VERSION` 同步）。开头有 `Free disk space` 步骤。
 
 ### 版本管理
 
@@ -1203,4 +1289,4 @@ make docker-build   # AIO 镜像
 >
 > 🚫 **commit message 禁止 `Co-Authored-By` 及任何 AI 署名行**，中文撰写。
 
-**维护者**：涵曦（<im.hanxi@gmail.com>）
+**维护者**：xinghuo（GitHub: [@Mars666613](https://github.com/Mars666613)）。本项目基于 [hanxi/cups-web](https://github.com/hanxi/cups-web)（原作者 涵曦）二次开发。

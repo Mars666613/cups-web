@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -80,6 +84,18 @@ type settingsPayload struct {
 	// PullTTLHours 是「员工有多久来取纸」。它与 retention_days 是两回事：
 	// 后者按打印记录的时间删文件，前者按取件时限。
 	PullTTLHours *int64 `json:"pullTtlHours"`
+
+	// ── 设备异常告警 ──
+	// AlertEnabled 是【总开关】：关掉等于不巡检、不记事件、不通知。
+	AlertEnabled *bool `json:"alertEnabled"`
+	// AlertWebhookURL 为空表示只记事件不外发（管理端页面上仍然看得到）。
+	AlertWebhookURL *string `json:"alertWebhookUrl"`
+	// AlertWebhookKind 取 auto / wechat / dingtalk / feishu / generic。
+	AlertWebhookKind *string `json:"alertWebhookKind"`
+	// AlertRepeatMinutes 是同一异常持续存在时的重发间隔；0 = 只提醒一次。
+	AlertRepeatMinutes *int64 `json:"alertRepeatMinutes"`
+	// AlertSupplyLowPercent 是「耗材不足」的判定阈值（百分比）。
+	AlertSupplyLowPercent *int64 `json:"alertSupplyLowPercent"`
 }
 
 // customCSSMaxLen 是自定义 CSS 的字节上限（32 KiB）。
@@ -156,7 +172,11 @@ func adminCreateUserHandler(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		created = user
-		return nil
+		// 「这个账号是谁建的」——多个管理员时，这是排查「怎么多了一个 admin」
+		// 的第一条线索。摘要里不写口令，一个字都不写。
+		return recordAudit(r.Context(), tx, sessionUsername(r), store.AuditUserCreate,
+			fmt.Sprintf("user#%d", user.ID),
+			fmt.Sprintf("新建用户 %s（角色 %s）", user.Username, roleText(role)))
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to create user")
@@ -240,7 +260,46 @@ func adminUpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		updated = user
-		return nil
+
+		// 审计的是【变更项】，不是整份表单。前端每次提交都会带上全部字段，
+		// 若照单记下来，「改了电话」和「什么都没改」在审计里长得一模一样。
+		//
+		// ⚠️ 口令只记「重置过」，绝不记内容，也不记哈希 —— 审计表是要给人
+		// 看的，而哈希泄露等于把离线爆破的时间成本白送出去。
+		changes := []auditChange{}
+		if user.Username != current.Username {
+			changes = append(changes, auditChange{
+				Field: "username", Text: fmt.Sprintf("用户名 %s → %s", current.Username, user.Username),
+				Before: current.Username, After: user.Username,
+			})
+		}
+		if user.Role != current.Role {
+			changes = append(changes, auditChange{
+				Field: "role", Text: fmt.Sprintf("角色 %s → %s", roleText(current.Role), roleText(user.Role)),
+				Before: current.Role, After: user.Role,
+			})
+		}
+		if pwdHash != nil {
+			changes = append(changes, auditChange{
+				Field: "passwordReset", Text: "重置了登录密码", Before: false, After: true,
+			})
+		}
+		for _, c := range []struct {
+			field, label, before, after string
+		}{
+			{"contactName", "联系人", current.ContactName, user.ContactName},
+			{"phone", "手机号", current.Phone, user.Phone},
+			{"email", "邮箱", current.Email, user.Email},
+		} {
+			if c.before != c.after {
+				changes = append(changes, auditChange{
+					Field: c.field, Text: fmt.Sprintf("%s %s → %s", c.label, dashIfEmpty(c.before), dashIfEmpty(c.after)),
+					Before: c.before, After: c.after,
+				})
+			}
+		}
+		return recordAudit(r.Context(), tx, sessionUsername(r), store.AuditUserUpdate,
+			fmt.Sprintf("user#%d", id), "", changes...)
 	})
 	if err != nil {
 		if errors.Is(err, errAdminRename) {
@@ -307,6 +366,13 @@ func adminDeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 		if hasTx {
 			return errUserHasTransactions
 		}
+		// 先记审计再删（同一个事务，顺序不影响结果）：此刻 user 还在手上，
+		// 用户名与余额是「这个人是谁」的最后一份证据。
+		if err := recordAudit(r.Context(), tx, sessionUsername(r), store.AuditUserDelete,
+			fmt.Sprintf("user#%d", id),
+			fmt.Sprintf("删除用户 %s（角色 %s，余额 %d 分）", user.Username, roleText(user.Role), user.BalanceCents)); err != nil {
+			return err
+		}
 		return store.DeleteUser(r.Context(), tx, id)
 	})
 	if err != nil {
@@ -339,80 +405,273 @@ func adminDeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+// settingsSnapshot 是系统设置的完整快照。
+//
+// 抽出来是为了让【同一组字段】有两个用途时只有一份读取代码：GET 的响应，
+// 以及 PUT 的「改动前 / 改动后」对比。原先 GET 里是一串逐个 GetSettingInt，
+// 若审计再写一份，将来新增设置项必然漏掉一处 —— 而漏在审计那一侧的症状
+// 是「界面上能改、审计里看不到」，几乎不会被发现。
+type settingsSnapshot struct {
+	RetentionDays   int64
+	SaveHistory     bool
+	MaxPagesPerJob  int64
+	MaxUploadBytes  int64
+	CustomCSS       string
+	GuestMode       bool
+	OrderTTLMinutes int64
+	PullModeEnabled bool
+	PullTTLHours    int64
+
+	// 设备异常告警（见 cmd/server/device_alert.go）。
+	AlertEnabled          bool
+	AlertWebhookURL       string
+	AlertWebhookKind      string
+	AlertRepeatMinutes    int64
+	AlertSupplyLowPercent int64
+}
+
+func loadSettingsSnapshot(ctx context.Context, tx *sql.Tx) (settingsSnapshot, error) {
+	var s settingsSnapshot
+	var err error
+
+	if s.RetentionDays, err = store.GetSettingInt(ctx, tx, store.SettingRetentionDays, 0); err != nil {
+		return s, err
+	}
+	saveHistory, err := store.GetSettingInt(ctx, tx, store.SettingSaveHistory, 1)
+	if err != nil {
+		return s, err
+	}
+	s.SaveHistory = saveHistory != 0
+
+	if s.MaxPagesPerJob, err = store.GetSettingInt(ctx, tx, store.SettingMaxPagesPerJob, 0); err != nil {
+		return s, err
+	}
+	if s.MaxUploadBytes, err = store.GetSettingInt(ctx, tx, store.SettingMaxUploadBytes, 0); err != nil {
+		return s, err
+	}
+	if s.CustomCSS, err = store.GetSettingString(ctx, tx, store.SettingCustomCSS, ""); err != nil {
+		return s, err
+	}
+	guestMode, err := store.GetSettingInt(ctx, tx, store.SettingGuestMode, 0)
+	if err != nil {
+		return s, err
+	}
+	s.GuestMode = guestMode != 0
+
+	if s.OrderTTLMinutes, err = store.GetSettingInt(ctx, tx, store.SettingOrderTTLMinutes, 15); err != nil {
+		return s, err
+	}
+	pullMode, err := store.GetSettingInt(ctx, tx, store.SettingPullModeEnabled, 0)
+	if err != nil {
+		return s, err
+	}
+	s.PullModeEnabled = pullMode != 0
+
+	if s.PullTTLHours, err = store.GetSettingInt(ctx, tx, store.SettingPullTTLHours, 72); err != nil {
+		return s, err
+	}
+
+	alertEnabled, err := store.GetSettingInt(ctx, tx, store.SettingAlertEnabled, 0)
+	if err != nil {
+		return s, err
+	}
+	s.AlertEnabled = alertEnabled != 0
+
+	if s.AlertWebhookURL, err = store.GetSettingString(ctx, tx, store.SettingAlertWebhookURL, ""); err != nil {
+		return s, err
+	}
+	if s.AlertWebhookKind, err = store.GetSettingString(ctx, tx, store.SettingAlertWebhookKind, "auto"); err != nil {
+		return s, err
+	}
+	if s.AlertRepeatMinutes, err = store.GetSettingInt(ctx, tx, store.SettingAlertRepeatMinutes, 60); err != nil {
+		return s, err
+	}
+	if s.AlertSupplyLowPercent, err = store.GetSettingInt(ctx, tx, store.SettingAlertSupplyLowPercent, 10); err != nil {
+		return s, err
+	}
+	return s, nil
+}
+
+// settingsChanges 比较前后两个快照，返回变更项。
+//
+// 中文标签与单位写在这里（而不是做成通用 diff）：只有这里知道
+// max_upload_bytes 要显示成 MB、orderTtlMinutes 的单位是分钟。
+func settingsChanges(before, after settingsSnapshot) []auditChange {
+	var out []auditChange
+	add := func(field, text string, b, a interface{}) {
+		out = append(out, auditChange{Field: field, Text: text, Before: b, After: a})
+	}
+
+	if before.RetentionDays != after.RetentionDays {
+		add("retentionDays", fmt.Sprintf("自动清理 %s → %s",
+			retentionText(before.RetentionDays), retentionText(after.RetentionDays)),
+			before.RetentionDays, after.RetentionDays)
+	}
+	if before.SaveHistory != after.SaveHistory {
+		add("saveHistory", fmt.Sprintf("保存打印历史 %s → %s",
+			onOff(before.SaveHistory), onOff(after.SaveHistory)),
+			before.SaveHistory, after.SaveHistory)
+	}
+	if before.MaxPagesPerJob != after.MaxPagesPerJob {
+		add("maxPagesPerJob", fmt.Sprintf("单任务最大页数 %s → %s",
+			limitText(before.MaxPagesPerJob), limitText(after.MaxPagesPerJob)),
+			before.MaxPagesPerJob, after.MaxPagesPerJob)
+	}
+	if before.MaxUploadBytes != after.MaxUploadBytes {
+		add("maxUploadBytes", fmt.Sprintf("单文件最大 %s → %s",
+			uploadLimitText(before.MaxUploadBytes), uploadLimitText(after.MaxUploadBytes)),
+			before.MaxUploadBytes, after.MaxUploadBytes)
+	}
+	// ⚠️ 自定义 CSS 只记【字节数】，不记内容。它上限 32KB，整段塞进审计行会
+	// 把列表页撑爆；而管理员真正要确认的是「有人动过它」。需要内容时去库里
+	// 看 settings 现值 —— 审计回答的是「什么时候变的」，不是「变成长什么样」。
+	if before.CustomCSS != after.CustomCSS {
+		add("customCssBytes", fmt.Sprintf("自定义 CSS %d → %d 字节",
+			len(before.CustomCSS), len(after.CustomCSS)),
+			len(before.CustomCSS), len(after.CustomCSS))
+	}
+	if before.GuestMode != after.GuestMode {
+		add("guestMode", fmt.Sprintf("访客模式 %s → %s",
+			onOff(before.GuestMode), onOff(after.GuestMode)),
+			before.GuestMode, after.GuestMode)
+	}
+	if before.OrderTTLMinutes != after.OrderTTLMinutes {
+		add("orderTtlMinutes", fmt.Sprintf("订单支付有效期 %d → %d 分钟",
+			before.OrderTTLMinutes, after.OrderTTLMinutes),
+			before.OrderTTLMinutes, after.OrderTTLMinutes)
+	}
+	if before.PullModeEnabled != after.PullModeEnabled {
+		add("pullModeEnabled", fmt.Sprintf("刷卡取件 %s → %s",
+			onOff(before.PullModeEnabled), onOff(after.PullModeEnabled)),
+			before.PullModeEnabled, after.PullModeEnabled)
+	}
+	if before.PullTTLHours != after.PullTTLHours {
+		add("pullTtlHours", fmt.Sprintf("取件时限 %d → %d 小时",
+			before.PullTTLHours, after.PullTTLHours),
+			before.PullTTLHours, after.PullTTLHours)
+	}
+	if before.AlertEnabled != after.AlertEnabled {
+		add("alertEnabled", fmt.Sprintf("设备告警 %s → %s",
+			onOff(before.AlertEnabled), onOff(after.AlertEnabled)),
+			before.AlertEnabled, after.AlertEnabled)
+	}
+	// ⚠️ webhook 地址里通常带 token（企业微信机器人的 key、钉钉的 access_token），
+	// 也就是【等同于口令】。审计里只记主机名，不记完整 URL —— 与「用户口令只记
+	// 重置过、不记内容」同一条理由。要看完整值就去设置页（管理员本来就能看到）。
+	if before.AlertWebhookURL != after.AlertWebhookURL {
+		add("alertWebhookHost", fmt.Sprintf("告警通知地址 %s → %s",
+			webhookHostText(before.AlertWebhookURL), webhookHostText(after.AlertWebhookURL)),
+			webhookHostText(before.AlertWebhookURL), webhookHostText(after.AlertWebhookURL))
+	}
+	if before.AlertWebhookKind != after.AlertWebhookKind {
+		add("alertWebhookKind", fmt.Sprintf("通知渠道 %s → %s",
+			before.AlertWebhookKind, after.AlertWebhookKind),
+			before.AlertWebhookKind, after.AlertWebhookKind)
+	}
+	if before.AlertRepeatMinutes != after.AlertRepeatMinutes {
+		add("alertRepeatMinutes", fmt.Sprintf("告警重发间隔 %s → %s",
+			repeatText(before.AlertRepeatMinutes), repeatText(after.AlertRepeatMinutes)),
+			before.AlertRepeatMinutes, after.AlertRepeatMinutes)
+	}
+	if before.AlertSupplyLowPercent != after.AlertSupplyLowPercent {
+		add("alertSupplyLowPercent", fmt.Sprintf("耗材不足阈值 %d%% → %d%%",
+			before.AlertSupplyLowPercent, after.AlertSupplyLowPercent),
+			before.AlertSupplyLowPercent, after.AlertSupplyLowPercent)
+	}
+	return out
+}
+
+// webhookHostText 只留主机名，去掉路径与查询串。
+//
+// 机器人的 webhook 把密钥放在【路径或 query】里（企业微信是 key=…，
+// 钉钉是 access_token=…），完整 URL 写进审计等于把密钥抄了一份到人人都能看的
+// 列表页上。主机名足够回答「原来发到企业微信、现在发到自建服务了」。
+func webhookHostText(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "（未配置）"
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return "（无法解析）"
+	}
+	return u.Hostname()
+}
+
+// repeatText 把「重发间隔」的分钟数翻成话。0 是一个特殊值（只提醒一次），
+// 直接显示「0 分钟」会让人以为是「不停地提醒」。
+func repeatText(minutes int64) string {
+	if minutes <= 0 {
+		return "只提醒一次"
+	}
+	return fmt.Sprintf("%d 分钟", minutes)
+}
+
+func onOff(b bool) string {
+	if b {
+		return "开启"
+	}
+	return "关闭"
+}
+
+func retentionText(days int64) string {
+	if days <= 0 {
+		return "不自动清理"
+	}
+	return fmt.Sprintf("%d 天", days)
+}
+
+func limitText(n int64) string {
+	if n <= 0 {
+		return "不限"
+	}
+	return fmt.Sprintf("%d 页", n)
+}
+
+func uploadLimitText(n int64) string {
+	if n <= 0 {
+		return "不限"
+	}
+	return fmt.Sprintf("%d MB", n/(1024*1024))
+}
+
+// dashIfEmpty 把空串显示成「空」，否则审计摘要里会出现「手机号  → 138…」
+// 这种两个空格并排、看不出改了什么的一句话。
+func dashIfEmpty(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "（空）"
+	}
+	return s
+}
+
 func adminGetSettingsHandler(w http.ResponseWriter, r *http.Request) {
-	var retention int64
-	var saveHistory int64
-	var maxPages int64
-	var maxBytes int64
-	var customCSS string
-	var guestMode int64
-	var orderTTLMinutes int64
-	var pullMode int64
-	var pullTTLVal int64
+	var snap settingsSnapshot
 	err := appStore.WithTx(r.Context(), true, func(tx *sql.Tx) error {
-		val, err := store.GetSettingInt(r.Context(), tx, store.SettingRetentionDays, 0)
-		if err != nil {
-			return err
-		}
-		retention = val
-		sh, err := store.GetSettingInt(r.Context(), tx, store.SettingSaveHistory, 1)
-		if err != nil {
-			return err
-		}
-		saveHistory = sh
-		mp, err := store.GetSettingInt(r.Context(), tx, store.SettingMaxPagesPerJob, 0)
-		if err != nil {
-			return err
-		}
-		maxPages = mp
-		mb, err := store.GetSettingInt(r.Context(), tx, store.SettingMaxUploadBytes, 0)
-		if err != nil {
-			return err
-		}
-		maxBytes = mb
-		css, err := store.GetSettingString(r.Context(), tx, store.SettingCustomCSS, "")
-		if err != nil {
-			return err
-		}
-		customCSS = css
-		gm, err := store.GetSettingInt(r.Context(), tx, store.SettingGuestMode, 0)
-		if err != nil {
-			return err
-		}
-		guestMode = gm
-		ttl, err := store.GetSettingInt(r.Context(), tx, store.SettingOrderTTLMinutes, 15)
-		if err != nil {
-			return err
-		}
-		orderTTLMinutes = ttl
-
-		pm, err := store.GetSettingInt(r.Context(), tx, store.SettingPullModeEnabled, 0)
-		if err != nil {
-			return err
-		}
-		pullMode = pm
-
-		pt, err := store.GetSettingInt(r.Context(), tx, store.SettingPullTTLHours, 72)
-		if err != nil {
-			return err
-		}
-		pullTTLVal = pt
-		return nil
+		var err error
+		snap, err = loadSettingsSnapshot(r.Context(), tx)
+		return err
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to load settings")
 		return
 	}
 	writeJSON(w, map[string]interface{}{
-		"retentionDays":   retention,
-		"saveHistory":     saveHistory != 0,
-		"maxPagesPerJob":  maxPages,
-		"maxUploadBytes":  maxBytes,
-		"customCss":       customCSS,
-		"guestMode":       guestMode != 0,
-		"orderTtlMinutes": orderTTLMinutes,
-		"pullModeEnabled": pullMode != 0,
-		"pullTtlHours":    pullTTLVal,
+		"retentionDays":   snap.RetentionDays,
+		"saveHistory":     snap.SaveHistory,
+		"maxPagesPerJob":  snap.MaxPagesPerJob,
+		"maxUploadBytes":  snap.MaxUploadBytes,
+		"customCss":       snap.CustomCSS,
+		"guestMode":       snap.GuestMode,
+		"orderTtlMinutes": snap.OrderTTLMinutes,
+		"pullModeEnabled": snap.PullModeEnabled,
+		"pullTtlHours":    snap.PullTTLHours,
+		// 设备异常告警。webhook 地址会回给前端（管理员本来就要能看见并改它），
+		// 但审计里只记主机名 —— 理由见 settingsChanges。
+		"alertEnabled":          snap.AlertEnabled,
+		"alertWebhookUrl":       snap.AlertWebhookURL,
+		"alertWebhookKind":      snap.AlertWebhookKind,
+		"alertRepeatMinutes":    snap.AlertRepeatMinutes,
+		"alertSupplyLowPercent": snap.AlertSupplyLowPercent,
 	})
 }
 
@@ -460,6 +719,15 @@ func adminUpdateSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err := appStore.WithTx(r.Context(), false, func(tx *sql.Tx) error {
+		// 「改之前」必须是【本事务内读到的一致快照】，不能在事务外先读一遍：
+		// 两个管理员同时保存时，事务外读到的值可能已经是别人改完之后的了 ——
+		// 那样审计会记成「B 把 30 改成了 60」，而真实过程是「A 改 30→60、
+		// B 改 60→90」。记错前值比不记更糟，因为它看起来是确定的。
+		before, err := loadSettingsSnapshot(r.Context(), tx)
+		if err != nil {
+			return err
+		}
+
 		if payload.OrderTTLMinutes != nil {
 			// 下界 1 分钟：0 或负数会让订单在创建瞬间就过期，
 			// 用户根本来不及付款。上界一天，避免误填出一个月。
@@ -570,7 +838,81 @@ func adminUpdateSettingsHandler(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 		}
-		return nil
+
+		// ── 设备异常告警 ──
+		if payload.AlertEnabled != nil {
+			// 开之前必须有通知地址，否则就是「开关打开、消息发不出去」——
+			// 那种状态比不告警更危险：管理员以为有人在看着。
+			//
+			// 判据用【保存后的最终值】：一次保存里同时改开关与地址是常态，
+			// 只看 payload 里的地址会在「地址没改、开关打开」时误判。
+			if *payload.AlertEnabled {
+				// 一次保存里同时改开关与地址是常态，所以要看「保存后的最终值」：
+				// 有请求里的地址就用请求里的，没有才回退到库里的现值。
+				url := strings.TrimSpace(before.AlertWebhookURL)
+				if payload.AlertWebhookURL != nil {
+					url = strings.TrimSpace(*payload.AlertWebhookURL)
+				}
+				if url == "" {
+					return errors.New("请先填写告警通知地址再开启设备告警")
+				}
+			}
+			if err := store.SetSettingInt(r.Context(), tx, store.SettingAlertEnabled, boolToInt(*payload.AlertEnabled)); err != nil {
+				return err
+			}
+		}
+		if payload.AlertWebhookURL != nil {
+			u := strings.TrimSpace(*payload.AlertWebhookURL)
+			// 必须是 http(s)。这里不做「能不能连通」的校验 —— 那是
+			// POST /api/admin/device-events/test 的活，而写得过于严格的
+			// 校验会把自建转发服务（内网 IP、非标准端口、带 query 的 token）
+			// 挡在外面。
+			if u != "" && !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+				return errors.New("告警通知地址必须以 http:// 或 https:// 开头")
+			}
+			if len(u) > 2048 {
+				return errors.New("告警通知地址过长")
+			}
+			if err := store.SetSettingString(r.Context(), tx, store.SettingAlertWebhookURL, u); err != nil {
+				return err
+			}
+		}
+		if payload.AlertWebhookKind != nil {
+			kind := strings.ToLower(strings.TrimSpace(*payload.AlertWebhookKind))
+			switch kind {
+			case "auto", "wechat", "dingtalk", "feishu", "generic":
+			default:
+				return errors.New("alertWebhookKind 取值不合法")
+			}
+			if err := store.SetSettingString(r.Context(), tx, store.SettingAlertWebhookKind, kind); err != nil {
+				return err
+			}
+		}
+		if payload.AlertRepeatMinutes != nil {
+			// 上界一天：再长的「重发」已经不属于提醒，而属于「忘了这件事」。
+			if *payload.AlertRepeatMinutes < 0 || *payload.AlertRepeatMinutes > 1440 {
+				return errors.New("alertRepeatMinutes 必须在 0 到 1440 之间（分钟，0 表示只提醒一次）")
+			}
+			if err := store.SetSettingInt(r.Context(), tx, store.SettingAlertRepeatMinutes, *payload.AlertRepeatMinutes); err != nil {
+				return err
+			}
+		}
+		if payload.AlertSupplyLowPercent != nil {
+			if *payload.AlertSupplyLowPercent < 0 || *payload.AlertSupplyLowPercent > 100 {
+				return errors.New("alertSupplyLowPercent 必须在 0 到 100 之间")
+			}
+			if err := store.SetSettingInt(r.Context(), tx, store.SettingAlertSupplyLowPercent, *payload.AlertSupplyLowPercent); err != nil {
+				return err
+			}
+		}
+
+		after, err := loadSettingsSnapshot(r.Context(), tx)
+		if err != nil {
+			return err
+		}
+		// 只记真正变了的字段（理由见 recordAudit 的第 3 条约定）。
+		return recordAudit(r.Context(), tx, sessionUsername(r), store.AuditSettingsUpdate,
+			"全局", "", settingsChanges(before, after)...)
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -585,6 +927,20 @@ func adminCleanupHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "cleanup failed: "+err.Error())
 		return
 	}
+
+	// ⚠️ 这一条审计【不能】和业务改动同事务 —— 清理动作的主体是【删文件】，
+	// 而文件系统不参与数据库事务。删都删完了，这里再回滚也换不回文件。
+	// 所以它是「事后补记」：写不进去时只能大声报错，不能假装没发生。
+	//
+	// 之所以仍然要记：这是全站唯一会把所有人的打印历史一次性抹掉的操作，
+	// 出了事（「昨天的记录怎么没了」）必须能查到是谁在几点点的。
+	if err := appStore.WithTx(r.Context(), false, func(tx *sql.Tx) error {
+		return recordAudit(r.Context(), tx, sessionUsername(r), store.AuditCleanupRun,
+			"全局", fmt.Sprintf("清空打印历史，删除 %d 个文件", count))
+	}); err != nil {
+		log.Printf("[audit] ⚠️ 清理已执行但审计未能写入（删了 %d 个文件）：%v", count, err)
+	}
+
 	writeJSON(w, map[string]interface{}{"ok": true, "deleted": count})
 }
 

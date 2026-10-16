@@ -17,7 +17,7 @@ package ipp
 // 实测：打印机离线时，cupsd 仍然报 state=idle、四个墨盒 70/60/50/70、
 // 五个纸盒 —— 全是它脑子里的印象，跟眼前这台机器没有关系。
 //
-// device-uri 是 cupsd 唯一给出的真实线索（`ipp://192.168.0.243/ipp/print`）。
+// device-uri 是 cupsd 唯一给出的真实线索（`ipp://192.168.1.100/ipp/print`）。
 // 拿它自己去问一次，才是真的。
 
 import (

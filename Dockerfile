@@ -82,7 +82,7 @@ WORKDIR /src
 
 # 构建期注入版本号（Issue #26）：
 #   - CI (docker-publish.yml) 会通过 `--build-arg VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}` 传入
-#     形如 `v1.2.3` 的 tag 名；push master 分支时传入 `dev`。
+#     形如 `v1.2.3` 的 tag 名；push main 分支时传入 `dev`。
 #   - 本地 `make docker-build` 会把 `git describe --tags --always --dirty` 透传进来。
 #   - 未指定时保持空字符串，让 main.Version 保持默认 "dev"，便于区分"未注入"与"注入失败"。
 ARG VERSION=""

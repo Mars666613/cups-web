@@ -2,15 +2,21 @@ name: Build and Push Docker images
 
 on:
   push:
-    branches: [ master ]
+    branches: [ main ]
     tags:
       - 'v*'
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build and push hanxi/cups-web
+    name: Build and push Docker image
     runs-on: ubuntu-latest
+    env:
+      # Docker Hub 命名空间取自仓库 secret，不要写死具体账号名 ——
+      # 一旦写死，别人 fork 出去的仓库会把镜像推到原作者的命名空间下。
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/cups-web
+    outputs:
+      tags: ${{ steps.tags.outputs.value }}
     steps:
       - name: Free disk space
         run: |
@@ -35,21 +41,35 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push hanxi/cups-web (multi-arch)
+      # 镜像 tag / VERSION：v* tag 推送用 tag 名（vX.Y.Z）并追加 latest；
+      # main 分支推送统一用 dev——不能拿分支名当 tag 名，
+      # "main" 镜像 tag 会与 main 分支/标签引用重名混淆。
+      #
+      # ⚠️ 为什么单独用一步算 tag，而不是直接在 tags: 里拼：
+      # 旧写法靠 YAML 块标量里的真实换行，把 "latest" 那一行接在 ${{ }} 的
+      # 字符串字面量里。镜像名前缀改成 ${{ env.IMAGE_NAME }} 之后，那个字面量
+      # 内部就出现了 }}，会提前终止外层 ${{ }} 的解析，整段变成语法错误。
+      # 放到 shell 里拼就完全绕开了这个问题（逗号是 build-push-action 认可的
+      # tag 分隔符）。
+      - name: Compute image tags
+        id: tags
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "value=${IMAGE_NAME}:${{ github.ref_name }},${IMAGE_NAME}:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${IMAGE_NAME}:dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push image (multi-arch)
         uses: docker/build-push-action@v6
         with:
           context: ./
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
-          # 镜像 tag / VERSION：v* tag 推送用 tag 名（vX.Y.Z）并追加 latest；
-          # master 分支推送统一用 dev——不能拿分支名当 tag 名，
-          # "master" 镜像 tag 会与 master 分支/标签引用重名混淆。
           build-args: |
             VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
-          tags: |
-            hanxi/cups-web:${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}${{ github.ref_type == 'tag' && '
-            hanxi/cups-web:latest' || '' }}
+          tags: ${{ steps.tags.outputs.value }}
           cache-from: type=gha,scope=cups-web
           cache-to: type=gha,scope=cups-web,mode=max
 
@@ -61,4 +81,4 @@ jobs:
     steps:
       - name: Output pushed image refs
         run: |
-          echo "Pushed hanxi/cups-web:${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}${{ github.ref_type == 'tag' && ' and hanxi/cups-web:latest' || '' }}"
+          echo "Pushed ${{ needs.build.outputs.tags }}"

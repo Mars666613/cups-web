@@ -35,7 +35,7 @@ const routes = [
     component: () => import('../views/RecordsView.vue'),
     meta: { requiresAuth: true }
   },
-  // 系统管理拆成了「落地菜单 + 六个子页」。
+  // 系统管理拆成了「落地菜单 + 多个子页」。
   // 每个子页只加载自己那一份数据（以前六块同页，进页面就并行拉四个全站列表），
   // 并且全部懒加载 —— 管理端代码不再进首屏包。
   // 子页清单与标签栏共用 utils/adminSections.js 那一份定义。
@@ -67,6 +67,23 @@ const routes = [
     path: '/admin/wallet',
     name: 'admin-wallet',
     component: () => import('../views/admin/AdminWalletView.vue'),
+    meta: { requiresAuth: true, requiresAdmin: true }
+  },
+  {
+    // 管理操作审计：只读列表。写入没有 HTTP 入口 —— 记录由业务改动
+    // 顺带产生（见后端 cmd/server/audit.go），所以这个子页没有任何提交动作。
+    path: '/admin/audit',
+    name: 'admin-audit',
+    component: () => import('../views/admin/AdminAuditView.vue'),
+    meta: { requiresAuth: true, requiresAdmin: true }
+  },
+  {
+    // 设备异常告警：配置（开关 / webhook / 阈值）+ 告警记录。
+    // 配置与记录放在同一页是有意的 —— 「为什么没收到消息」和「哪儿配错了」
+    // 是同一个问题，分成两页就得来回跳。
+    path: '/admin/alerts',
+    name: 'admin-alerts',
+    component: () => import('../views/admin/AdminAlertsView.vue'),
     meta: { requiresAuth: true, requiresAdmin: true }
   },
   {

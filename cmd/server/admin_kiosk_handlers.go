@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -99,7 +100,15 @@ func adminCreateKioskTerminalHandler(w http.ResponseWriter, r *http.Request) {
 		Enabled:    true,
 	}
 	if err := appStore.WithTx(r.Context(), false, func(tx *sql.Tx) error {
-		return store.CreateKioskTerminal(r.Context(), tx, term)
+		if err := store.CreateKioskTerminal(r.Context(), tx, term); err != nil {
+			return err
+		}
+		// 终端 token 是一张「能把任务取走」的凭据（见 StoreKioskFiles 链路），
+		// 所以「谁加了终端」值得留痕 —— 它是取件权限的来源。
+		// 🚫 token 本身不进审计：它等同于口令，而审计页是给人翻的。
+		return recordAudit(r.Context(), tx, sessionUsername(r), store.AuditTerminalCreate,
+			term.Name,
+			fmt.Sprintf("新增取件终端「%s」（%s）", term.Name, terminalTargetText(term.PrinterURI)))
 	}); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to create terminal")
 		return
@@ -140,7 +149,43 @@ func adminUpdateKioskTerminalHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err := appStore.WithTx(r.Context(), false, func(tx *sql.Tx) error {
-		return store.UpdateKioskTerminal(r.Context(), tx, token, payload.Name, payload.PrinterURI, enabled)
+		// 前后各取一次，才能说清「改了什么」。
+		before, err := store.GetKioskTerminal(r.Context(), tx, token)
+		if err != nil {
+			return err
+		}
+		if err := store.UpdateKioskTerminal(r.Context(), tx, token, payload.Name, payload.PrinterURI, enabled); err != nil {
+			return err
+		}
+		after, err := store.GetKioskTerminal(r.Context(), tx, token)
+		if err != nil {
+			return err
+		}
+
+		var changes []auditChange
+		if after.Name != before.Name {
+			changes = append(changes, auditChange{
+				Field: "name", Text: fmt.Sprintf("名称 %s → %s", before.Name, after.Name),
+				Before: before.Name, After: after.Name,
+			})
+		}
+		if after.PrinterURI != before.PrinterURI {
+			changes = append(changes, auditChange{
+				Field: "printerUri", Text: fmt.Sprintf("绑定打印机 %s → %s",
+					terminalTargetText(before.PrinterURI), terminalTargetText(after.PrinterURI)),
+				Before: before.PrinterURI, After: after.PrinterURI,
+			})
+		}
+		// 停用终端 = 员工到机器旁取不出纸。这条一定要留痕：现场报障时
+		// 「终端怎么不好使了」的第一嫌疑就是它被谁改了。
+		if after.Enabled != before.Enabled {
+			changes = append(changes, auditChange{
+				Field: "enabled", Text: fmt.Sprintf("启用状态 %s → %s", onOff(before.Enabled), onOff(after.Enabled)),
+				Before: before.Enabled, After: after.Enabled,
+			})
+		}
+		return recordAudit(r.Context(), tx, sessionUsername(r), store.AuditTerminalUpdate,
+			after.Name, "", changes...)
 	})
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -156,6 +201,17 @@ func adminUpdateKioskTerminalHandler(w http.ResponseWriter, r *http.Request) {
 func adminDeleteKioskTerminalHandler(w http.ResponseWriter, r *http.Request) {
 	token := mux.Vars(r)["token"]
 	err := appStore.WithTx(r.Context(), false, func(tx *sql.Tx) error {
+		// 先读出来再删：删完就查不到「删的是哪一台」了，而审计记录里
+		// 只剩一个 token 前缀的话，管理员对着它无法确认是不是自己要删的那台。
+		before, err := store.GetKioskTerminal(r.Context(), tx, token)
+		if err != nil {
+			return err
+		}
+		if err := recordAudit(r.Context(), tx, sessionUsername(r), store.AuditTerminalDelete,
+			before.Name,
+			fmt.Sprintf("删除取件终端「%s」（%s）", before.Name, terminalTargetText(before.PrinterURI))); err != nil {
+			return err
+		}
 		return store.DeleteKioskTerminal(r.Context(), tx, token)
 	})
 	if err != nil {

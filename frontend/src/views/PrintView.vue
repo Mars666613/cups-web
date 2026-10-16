@@ -154,8 +154,9 @@
          外层栅格的项 —— 这样才排得出「上传 → 参数 → 预览 → 费用 → 按钮」。
          否则预览被关在右栏里，永远只能整体排在左栏（含费用和按钮）之后，
          用户会先看到要花多少钱、再看到打出来长什么样。
-         桌面端 lg:block 把包装器还原成真实盒子，order-* 在块布局里不生效。 -->
-    <div v-if="entered" class="grid grid-cols-1 lg:grid-cols-5 gap-4">
+         桌面端 lg:block 把包装器还原成真实盒子，order-* 在块布局里不生效。
+         复印模式没有上传/预览可言，走下面那块独立面板。 -->
+    <div v-if="entered && printMode !== 'copy'" class="grid grid-cols-1 lg:grid-cols-5 gap-4">
       <!-- 左栏：上传 + 打印参数 -->
       <div class="contents lg:block lg:col-span-2 lg:space-y-4">
         <div class="order-1 space-y-4">
@@ -423,10 +424,232 @@
             :printer-uri="printer"
             :loading="loadingPrinterInfo"
             :error="printerInfoError"
-            @refresh="loadPrinterInfo"
+            @refresh="() => loadPrinterInfo()"
           />
         </div><!-- /order-4：记录与状态 -->
       </div><!-- /右栏 -->
+    </div>
+
+    <!-- ── 远程复印模式：独立面板 ────────────────────────────────
+         复印没有「文件」概念：原件在打印机上，界面只需要回答
+         「扫描仪通不通、扫什么参数、什么时候开始」。
+         计费开启时，提交返回的是待支付订单批次，复用支付弹窗；
+         免费 / 取件模式下提交即扫描送印（取件模式不需要刷卡 ——
+         用户人就在打印机旁，再刷一次卡是纯粹的重复劳动）。 -->
+    <div v-if="entered && printMode === 'copy'" class="max-w-2xl mx-auto space-y-4">
+      <UCard :ui="{ body: 'p-4 sm:p-6 space-y-4' }">
+        <!-- 扫描仪状态 -->
+        <div class="flex items-center gap-2 text-sm">
+          <UIcon name="i-lucide-copy" class="w-4 h-4 text-primary shrink-0" />
+          <template v-if="copyStatusLoading && !copyStatus">
+            <span class="text-muted">正在检测扫描仪…</span>
+          </template>
+          <template v-else-if="copyStatus?.available">
+            <span class="font-medium">{{ copyStatus.model || '扫描仪就绪' }}</span>
+            <span
+              class="inline-block w-2 h-2 rounded-full shrink-0"
+              :class="copyStatus.idle ? 'bg-success' : 'bg-warning'"
+              :title="copyStatus.idle ? '空闲' : '正忙（可能是别的扫描任务）'"
+            />
+            <span class="text-muted">{{ copyStatus.idle ? '空闲' : '正忙' }}</span>
+          </template>
+          <template v-else>
+            <span class="text-error">{{ copyStatus?.reason || copyStatusError || '扫描仪不可用' }}</span>
+          </template>
+        </div>
+
+        <!-- 操作说明 -->
+        <UAlert
+          color="primary"
+          variant="soft"
+          icon="i-lucide-info"
+          title="操作步骤"
+          description="1. 选好原件放在哪：玻璃板（一次一页）或进稿器（可多页/双面）；2. 把原件放好；3. 点「开始复印」，等扫描完成后出纸。扫完请及时取走原件。"
+        />
+
+        <!-- 参数 -->
+        <div class="space-y-3">
+          <div class="flex items-center gap-3 text-sm">
+            <span class="text-muted shrink-0 w-16">色彩</span>
+            <div class="flex rounded-lg border border-muted overflow-hidden">
+              <label
+                v-for="opt in copyColorOptions"
+                :key="opt.value"
+                class="px-3 py-1 cursor-pointer text-sm transition"
+                :class="copyColor === opt.value ? 'bg-primary text-white font-medium' : 'hover:bg-elevated'"
+                :title="opt.disabled ? '这台打印机不支持彩色扫描' : ''"
+              >
+                <input
+                  v-model="copyColor"
+                  type="radio"
+                  :value="opt.value"
+                  :disabled="opt.disabled"
+                  class="sr-only"
+                />
+                {{ opt.label }}
+              </label>
+            </div>
+          </div>
+
+          <!-- 放稿方式必须让用户显式选。猜错的代价是两个极端：原件在进稿器
+               里却按玻璃板扫 → 出来一张空白纸还照样打印；原件在玻璃板上
+               却按进稿器扫 → 设备直接终止任务。 -->
+          <div class="flex items-center gap-3 text-sm">
+            <span class="text-muted shrink-0 w-16">放稿</span>
+            <div class="flex rounded-lg border border-muted overflow-hidden">
+              <label
+                v-for="opt in copyInputOptions"
+                :key="opt.value"
+                class="px-3 py-1 cursor-pointer text-sm transition"
+                :class="copyInput === opt.value ? 'bg-primary text-white font-medium' : 'hover:bg-elevated'"
+                :title="opt.disabled ? opt.unavailableHint : opt.hint"
+              >
+                <input
+                  v-model="copyInput"
+                  type="radio"
+                  :value="opt.value"
+                  :disabled="opt.disabled"
+                  class="sr-only"
+                  @change="copyInputTouched = true"
+                />
+                {{ opt.label }}
+              </label>
+            </div>
+            <!-- 设备对进稿器装载状态的报告：放错位置时当场就能看出来。
+                 只是提示，不拦提交（读数是设备传感器给的，会随放纸自动刷新）。 -->
+            <span
+              v-if="copyAdfStateHint"
+              class="text-xs"
+              :class="copyStatus?.adfLoaded ? 'text-success' : 'text-warning'"
+              title="设备的装载传感器读数，每几秒自动刷新；即使显示未检测到也可以直接开始复印"
+            >
+              {{ copyAdfStateHint }}
+            </span>
+          </div>
+
+          <!-- 原件的单/双面只对进稿器有意义，玻璃板一次就是一页。 -->
+          <div v-if="copyInput === 'adf'" class="flex items-center gap-3 text-sm">
+            <span class="text-muted shrink-0 w-16">原件</span>
+            <div class="flex rounded-lg border border-muted overflow-hidden">
+              <label
+                v-for="opt in copySourceOptions"
+                :key="opt.value"
+                class="px-3 py-1 cursor-pointer text-sm transition"
+                :class="copyAdfDuplex === opt.value ? 'bg-primary text-white font-medium' : 'hover:bg-elevated'"
+                :title="opt.disabled ? '这台打印机不支持双面扫描' : ''"
+              >
+                <input
+                  v-model="copyAdfDuplex"
+                  type="radio"
+                  :value="opt.value"
+                  :disabled="opt.disabled"
+                  class="sr-only"
+                />
+                {{ opt.label }}
+              </label>
+            </div>
+            <span class="text-muted text-xs">双面原件请选「双面」</span>
+          </div>
+
+          <div class="flex items-center gap-3 text-sm">
+            <span class="text-muted shrink-0 w-16">输出</span>
+            <div class="flex rounded-lg border border-muted overflow-hidden">
+              <label
+                v-for="opt in [{ label: '单面', value: false }, { label: '双面', value: true }]"
+                :key="String(opt.value)"
+                class="px-3 py-1 cursor-pointer text-sm transition"
+                :class="copyDuplexOut === opt.value ? 'bg-primary text-white font-medium' : 'hover:bg-elevated'"
+              >
+                <input v-model="copyDuplexOut" type="radio" :value="opt.value" class="sr-only" />
+                {{ opt.label }}
+              </label>
+            </div>
+          </div>
+
+          <div class="flex items-center gap-3 text-sm">
+            <span class="text-muted shrink-0 w-16">份数</span>
+            <UInput
+              v-model.number="copyCopies"
+              type="number"
+              :min="1"
+              :max="99"
+              class="w-24"
+              :disabled="copying"
+            />
+          </div>
+
+          <div class="flex items-center gap-3 text-sm">
+            <span class="text-muted shrink-0 w-16">纸张</span>
+            <USelect
+              v-model="copyPaperSize"
+              :items="copyPaperOptions"
+              class="w-40"
+              :disabled="copying"
+            />
+            <!-- 纸张同时决定扫描区域：扫描件页面与纸张同形，打印才能 1:1。
+                 给大了（按设备最大幅面）会采成 A3 页面，打印时被转 90° 缩
+                 小，出来就是横着的复印件。 -->
+            <span class="text-muted text-xs">原件按此尺寸扫描，原样 1:1 打印</span>
+          </div>
+        </div>
+
+        <!-- 进稿器里没纸的确认：不让一次注定失败的任务白走十几秒。
+             「仍然继续」是给设备误报留的出口（少数机型常年报空）——
+             只对这一次提交有效，见 startCopy 里的说明。 -->
+        <UAlert
+          v-if="copyAdfConfirm"
+          color="warning"
+          variant="soft"
+          icon="i-lucide-alert-triangle"
+          title="进稿器里没有检测到原件"
+          description="请把原件放进进稿器（正面朝上、两侧导板贴住纸边）。如果确实已经放好，点「仍然继续」按进稿器扫描这一次。"
+        >
+          <template #actions>
+            <UButton color="warning" size="sm" icon="i-lucide-arrow-right" @click="continueCopyAnyway">
+              仍然继续
+            </UButton>
+          </template>
+        </UAlert>
+
+        <!-- 扫描件空白：后端已经扫完并判定整页空白（原件没放好时设备照样
+             交回一张全白页，不会报错）。确认是「我真的就是要印一张白纸」
+             才继续，否则回去检查原件。 -->
+        <UAlert
+          v-if="copyBlankConfirm"
+          color="error"
+          variant="soft"
+          icon="i-lucide-file-x"
+          title="这次扫描得到的是一张空白页"
+          description="原件多半没有放好：放稿方式与原件实际位置不一致、盖板没压住、或纸没进进稿器。请检查后重新复印。确认原件本身就是空白页，才点「仍然继续」。"
+        >
+          <template #actions>
+            <UButton color="error" size="sm" icon="i-lucide-arrow-right" @click="continueBlankAnyway">
+              仍然继续
+            </UButton>
+          </template>
+        </UAlert>
+
+        <!-- 开始复印 -->
+        <UButton
+          color="primary"
+          size="xl"
+          :ui="{ base: 'justify-center', label: 'flex-1 text-center' }"
+          class="w-full font-semibold tracking-wide"
+          icon="i-lucide-copy"
+          :disabled="!copyCanStart"
+          :loading="copying"
+          @click="startCopy"
+        >
+          {{ copying ? '正在扫描，请稍候…' : (billing.enabled ? '扫描并下单' : '开始复印') }}
+        </UButton>
+
+        <p v-if="billing.enabled" class="text-xs text-muted text-center">
+          扫描完成后生成订单，付款后打印机才会开始复印；未支付订单会自动作废。
+        </p>
+        <p v-else-if="pull.enabled" class="text-xs text-muted text-center">
+          复印不受刷卡取件限制：提交后直接扫描出纸，无需刷卡。
+        </p>
+      </UCard>
     </div>
 
     <!-- CUPS 任务列表弹窗（issue #60）：查看/取消 CUPS 未完成任务 -->
@@ -523,10 +746,24 @@
   </div>
 </template>
 
+<script>
+// ⚠️ 这个标记必须在 <script setup> 之外。
+//
+// 它表达的是一件只有【整份文档】才能回答的事：「本次文档加载的恢复机会
+// 用掉了没有」。放进 <script setup> 里，它就会随每次挂载重新变成 false，
+// 等于没写 —— 而它要挡的正是「挂载」这件事。
+//
+// 放在模块作用域，语义天然正确：跨组件实例存活（同一份文档里反复进出
+// /print 都看得见），随整页加载重建（刷新之后又能恢复一次）。
+// 用法与理由见 restoreAfterReload()。
+let reloadRestoreConsumed = false
+</script>
+
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { apiFetch, readError, readJSON } from '../utils/api'
+import { printHomeSignal } from '../utils/printHomeSignal'
 import { isOfficeFile, isOFDFile } from '../utils/file'
 import { downscaleImageIfNeeded } from '../utils/image'
 import { estimateImageDocPages } from '../utils/pricing'
@@ -617,7 +854,10 @@ const printModeItems = [
   { label: '标准打印', value: 'standard', icon: 'i-lucide-file-text', hint: '上传 PDF / 图片 / Office 文档' },
   { label: '文字速印', value: 'text', icon: 'i-lucide-clipboard-type', hint: '粘贴一段文字直接打印' },
   { label: '发票打印', value: 'invoice', icon: 'i-lucide-receipt', hint: '多张发票合并到一页' },
-  { label: '身份证打印', value: 'id_card', icon: 'i-lucide-id-card', hint: '正反面复印到一张纸上' }
+  { label: '身份证打印', value: 'id_card', icon: 'i-lucide-id-card', hint: '正反面复印到一张纸上' },
+  // 远程复印：文件不来自上传，而是打印机自己的扫描仪（eSCL/AirScan）现场采集。
+  // 不支持的打印机会在复印页里给出明确原因，因此入口始终展示。
+  { label: '远程复印', value: 'copy', icon: 'i-lucide-copy', hint: '原件放好，手机直接控制复印' }
 ]
 
 // 是否已经选好模式进入打印页。
@@ -727,6 +967,26 @@ function restoreAfterReload() {
   //   unknown               → 浏览器不支持 Navigation Timing
   console.info('[print] 页面加载类型:', navType(),
     '| 上次退出时已进入打印页:', sessionStorage.getItem(RESTORE_KEY) || '（无）')
+
+  // ⚠️ 只认【本文档加载后的第一次挂载】。这一行修掉的是一个真机故障：
+  //
+  // navType() 描述的是【整份文档】是怎么被加载的，SPA 内部的路由跳转
+  // 不会改变它。于是用户只要按过一次 F5（或手机被回收后恢复过一次），
+  // 此后在同一份文档里【每一次】进入这个页面 isBrowserReload() 都是真，
+  // 恢复逻辑就一直生效 —— 点个人中心再点在线打印，会直接落回上次的模式页，
+  // 与这里刻意的入口设计（进来永远先看落地页）正好相反。
+  //
+  // 实测表现：电脑端「个人中心 → 在线打印」回不到首页（开发时要刷新页面，
+  // 于是 type 常年是 reload），手机端却能（手机是导航进来，type 是 navigate）。
+  // 同一个页面、两套行为，差别只在这里。
+  //
+  // 恢复只对「重载后的第一次挂载」有意义 —— 那一次 JS 状态是真的丢了。
+  // 之后每次挂载都是【导航】造成的，不是重载。
+  if (reloadRestoreConsumed) return false
+  // 无论这次是否真的恢复，机会都算用掉：本次文档加载之后进来的每一次
+  // 都是导航，不该再被当成重载。（先消费再判断，正是为了避免
+  // 「第一次进来时还在落地页、于是不恢复，第二次带着模式进来却恢复了」。）
+  reloadRestoreConsumed = true
 
   if (!isBrowserReload()) return false
   try {
@@ -856,6 +1116,14 @@ function backToLanding() {
   restoredFromReload.value = false
   reloadNotice.value = ''
 }
+
+// 顶栏「在线打印」在【已经处于本页】时发来的信号（见 utils/printHomeSignal.js）：
+// 这时路由不会变，push 是空操作，只能由页面自己退回落地页。
+//
+// 刻意不清理已选的内容：回来再点同一个模式，界面还是原样。误点一下顶栏
+// 不至于把刚排好的参数和文件抹掉 —— 那比「没回到首页」更难受。
+// 回首页时若要停掉什么，watch([... entered ...]) 已经在管（如复印状态轮询）。
+watch(printHomeSignal, () => backToLanding())
 // 文字速印(issue #70):用户直接粘贴一段文字就能打,省去先建 .txt 再上传的步骤。
 // 内容用 File 包装喂给现有 processFile 流程,后端已支持 fileKindText。
 const quickText = ref('')
@@ -883,7 +1151,19 @@ const jobsError = ref('')
 const cancelingJobId = ref(0)
 let jobsTimer = null
 
+// jobsInFlight 是「上一次请求还没回来」的标记。
+//
+// ⚠️ 轮询必须带这个开关，不能只靠 setInterval。后端那次读 CUPS 卡住时
+// （实测 15 秒），5 秒的轮询会连发 3 条请求；它们全卡在同一条裤带上，
+// 而浏览器对同一个源的并发连接只有 6 条 —— 卡满之后【登录态检查、支付
+// 轮询、下单】全都要排在它们后面。一次后端卡顿就变成整个页面不动。
+let jobsInFlight = 0
+
 async function loadJobs(showLoading = false) {
+  // 静默轮询不叠加：上一次还没回来就跳过这一次（理由见 jobsInFlight）。
+  // 用户手点的刷新（showLoading=true）不拦 —— 点了没反应比多一条请求更糟。
+  if (!showLoading && jobsInFlight > 0) return
+  jobsInFlight++
   if (showLoading) loadingJobs.value = true
   jobsError.value = ''
   try {
@@ -896,6 +1176,7 @@ async function loadJobs(showLoading = false) {
   } catch (e) {
     jobsError.value = e?.message || '加载失败'
   } finally {
+    jobsInFlight--
     loadingJobs.value = false
   }
 }
@@ -949,6 +1230,13 @@ function jobStateClass(j) {
 const printerInfo = ref(null)
 const loadingPrinterInfo = ref(false)
 const printerInfoError = ref('')
+
+// printerInfoInFlight 与 jobsInFlight 同理，而且这里更危险：定时器是
+// 15 秒一次，后端那次卡顿恰好也是 15 秒 —— 两者相等意味着【只要卡住
+// 一次，下一次就必然在它还没回来时发出】，请求会稳定地堆起来（实测
+// 用户截图里同时挂着 8 条 printer-info）。加了这个开关，卡住时下一次
+// 轮询直接跳过，等它回来再继续。
+let printerInfoInFlight = 0
 
 // deviceState 是打印机名字旁边那个连接状态灯。
 //
@@ -1672,6 +1960,10 @@ async function uploadAndPrint() {
 // ─── 打印机状态 ───────────────────────────────────────────
 async function loadPrinterInfo(silent = false) {
   if (!printer.value) return
+  // 静默轮询不叠加（理由见 printerInfoInFlight 的说明）。
+  // 用户手点的刷新不拦：他刚点完就什么都不发生，看起来就是按钮坏了。
+  if (silent && printerInfoInFlight > 0) return
+  printerInfoInFlight++
   if (!silent) loadingPrinterInfo.value = true
   printerInfoError.value = ''
   try {
@@ -1697,6 +1989,7 @@ async function loadPrinterInfo(silent = false) {
     // 直连探测的结论，由 deviceState 单独呈现。
     printerInfoError.value = '读取打印机状态失败：' + (e?.message || e)
   } finally {
+    printerInfoInFlight--
     loadingPrinterInfo.value = false
   }
 }
@@ -2076,6 +2369,279 @@ async function submitPullOrder(form) {
     toast.add({ title: '提交失败', description: e.message, color: 'error', icon: 'i-lucide-x-circle' })
   } finally {
     printing.value = false
+  }
+}
+
+// ─── 远程复印 ─────────────────────────────────────────────
+// 状态/能力来自 GET /api/copy/status（后端经 eSCL 直连探测），
+// 提交走 POST /api/copy：计费开 → 待支付订单批次（复用支付弹窗）；
+// 免费或取件模式 → 直接扫描送印。
+const copyStatus = ref(null)
+const copyStatusLoading = ref(false)
+const copyStatusError = ref('')
+const copyColor = ref(false)
+// 放稿方式：'platen' 玻璃板（一次一页）/ 'adf' 进稿器（可多页、可双面）。
+// 默认玻璃板 —— 单张复印是最常见的用法，而且猜成进稿器会让设备直接
+// 终止任务（进稿器里没纸），猜成玻璃板最多是多走一次流程。
+const copyInput = ref('platen')
+// 用户一旦自己点过「放稿」，就不再替他改主意：状态刷新时自动推荐只在
+// 没人碰过这个选项时才生效，否则会和用户的手动选择打架。
+const copyInputTouched = ref(false)
+// 设备说进稿器里没纸时的确认流（见 startCopy）。两个确认互不替代：
+// adf 那条对应「设备没检测到原件」，blank 那条对应「扫描结果整页空白」，
+// 各自只放开自己那一道闸（后端 forceInput / forceBlank）。
+const copyAdfConfirm = ref(false)
+const copyAdfForce = ref(false)
+const copyBlankConfirm = ref(false)
+const copyBlankForce = ref(false)
+const copyAdfDuplex = ref(false)
+const copyDuplexOut = ref(false)
+const copyCopies = ref(1)
+const copyPaperSize = ref('A4')
+const copying = ref(false)
+
+const copyColorOptions = computed(() => [
+  { label: '黑白', value: false, disabled: false },
+  { label: '彩色', value: true, disabled: !(copyStatus.value?.color) }
+])
+const copyInputOptions = computed(() => [
+  {
+    label: '玻璃板',
+    value: 'platen',
+    disabled: copyStatus.value?.available === true && !copyStatus.value?.hasPlaten,
+    hint: '一次一页',
+    unavailableHint: '这台打印机没有玻璃板'
+  },
+  {
+    label: '进稿器',
+    value: 'adf',
+    disabled: copyStatus.value?.available === true && !copyStatus.value?.hasAdf,
+    hint: '可多页、可双面',
+    unavailableHint: '这台打印机没有进稿器'
+  }
+])
+
+// 进稿器里有没有原件，设备是知道的 —— 直接说出来，用户就不必等到
+// 「纸没动却报错」才发现放错了位置。设备不上报 AdfState 时返回空串：
+// 显示「未检测到原件」会把没问题的机器说成有问题的。
+const copyAdfStateHint = computed(() => {
+  const s = copyStatus.value
+  if (!s?.available || !s.hasAdf) return ''
+  if (s.adfLoaded) return '进稿器：检测到原件'
+  if (s.adfState === 'ScannerAdfEmpty') return '进稿器：未检测到原件'
+  return ''
+})
+const copySourceOptions = computed(() => [
+  { label: '单面', value: false, disabled: false },
+  { label: '双面', value: true, disabled: !(copyStatus.value?.adfDuplex) }
+])
+const copyPaperOptions = [
+  { label: 'A4 (210×297mm)', value: 'A4' },
+  { label: 'A5 (148×210mm)', value: 'A5' },
+  { label: 'A3 (297×420mm)', value: 'A3' }
+]
+
+// 可开始：打印机选好、扫描仪在线且空闲、所选放稿方式这台设备真的具备、
+// 没有正在进行的复印。
+// 设备正忙时不禁用按钮而是允许提交 —— 后端会在创建任务时返回明确的
+// 「扫描仪正忙」，多页任务结束的瞬间与轮询之间有时间差，禁用会把
+// 本可以成功的提交拦下来。
+const copyInputAvailable = computed(() => {
+  const s = copyStatus.value
+  if (!s?.available) return false
+  return copyInput.value === 'adf' ? !!s.hasAdf : !!s.hasPlaten
+})
+const copyCanStart = computed(() =>
+  !!printer.value && copyStatus.value?.available === true && copyInputAvailable.value && !copying.value
+)
+
+// silent = 后台轮询：保留上一次的结果，不把界面清空、不覆盖错误提示。
+// 状态刷新走它，否则面板每几秒闪一次「加载中」。
+// copyStatusInFlight 与 printerInfoInFlight 同一套（理由见那里的说明）。
+let copyStatusInFlight = 0
+
+async function loadCopyStatus(silent = false) {
+  if (!printer.value || printMode.value !== 'copy') return
+  // 与 printerInfo / jobs 同一套：静默轮询不叠加。这条建议间隔 4 秒，
+  // 而 /api/copy/status 要现场问设备的能力，一次卡住同样会把轮询堆起来。
+  if (silent && copyStatusInFlight > 0) return
+  copyStatusInFlight++
+  if (!silent) {
+    copyStatusLoading.value = true
+    copyStatusError.value = ''
+    copyStatus.value = null
+  }
+  try {
+    const resp = await apiFetch(
+      `/api/copy/status?printer=${encodeURIComponent(printer.value)}`,
+      {},
+      () => emit('logout')
+    )
+    if (resp.ok) {
+      copyStatus.value = await readJSON(resp)
+    } else if (resp.status !== 401) {
+      // 轮询失败不覆盖上一次的结论：设备抖一下（本机固件偶尔裸 400）
+      // 不该把界面清空成「不可用」。
+      if (!silent) copyStatusError.value = await readError(resp)
+    }
+  } catch (e) {
+    if (!silent) copyStatusError.value = e?.message || '检测失败'
+  } finally {
+    copyStatusInFlight--
+    if (!silent) copyStatusLoading.value = false
+  }
+}
+
+// 复印页开着时轮询状态：进稿器里有没有纸是设备当场就知道的事，
+// 只在进页面时探一次，会把「刚放好纸」一直显示成「未检测到原件」。
+const COPY_STATUS_POLL_MS = 4000
+let copyPollTimer = null
+function startCopyPolling() {
+  stopCopyPolling()
+  copyPollTimer = setInterval(() => {
+    // 标签页不可见时不打扰设备；正在扫描时也不查（那一刻设备本来就忙）。
+    if (document.visibilityState === 'visible' && !copying.value) loadCopyStatus(true)
+  }, COPY_STATUS_POLL_MS)
+}
+function stopCopyPolling() {
+  if (copyPollTimer) {
+    clearInterval(copyPollTimer)
+    copyPollTimer = null
+  }
+}
+
+// 进入复印页或换打印机都要重新探测。
+watch([printer, printMode, entered], () => {
+  loadCopyStatus()
+  if (entered.value && printMode.value === 'copy') startCopyPolling()
+  else stopCopyPolling()
+})
+
+onUnmounted(stopCopyPolling)
+
+// 双面原件选项在换到不支持的打印机后要回落成单面，
+// 否则界面停在「双面」但提交必败。
+// 放稿方式也要跟着设备能力回落，否则用户会停在一个这台机器根本没有的选项上。
+watch(copyStatus, (s) => {
+  if (!s) return
+  if (!s.adfDuplex && copyAdfDuplex.value) copyAdfDuplex.value = false
+  if (!s.color && copyColor.value) copyColor.value = false
+  if (!s.hasPlaten && copyInput.value === 'platen') copyInput.value = 'adf'
+  else if (!s.hasAdf && copyInput.value === 'adf') copyInput.value = 'platen'
+  // 默认值跟着原件实际所在的位置走：纸在进稿器里就默认按进稿器扫。
+  // 猜错的代价不对称 —— 猜成玻璃板会扫出一张空白纸、还照样打印，
+  // 猜成进稿器只是被设备明确拒绝。
+  if (!copyInputTouched.value && s.hasAdf && s.adfLoaded) copyInput.value = 'adf'
+})
+
+// 玻璃板没有「原件双面」这回事，切回玻璃板时把该状态清掉，
+// 免得它在提交时被带上去（后端也会拦，但界面不该先把用户带进沟里）。
+watch(copyInput, (v) => {
+  if (v !== 'adf') copyAdfDuplex.value = false
+})
+
+// 用户确认「纸确实放好了」：带 forceInput 重发，后端不再拦这道。
+// 设备偶尔会报错装载状态，明知道放了纸却被挡在门外是最糟的体验。
+//
+// 🚫 确认只对【这一次提交】有效，不再写 sessionStorage 变成「本次会话内
+// 永久信任」。早先那版就是这么写的，结果是：用户在空进稿器上点过一次
+// 「仍然继续」之后，此后每一次复印都静默跳过空纸检查 —— 页面明明白白写着
+// 「未检测到原件」，点下去却照样扫描、照样生成订单（2026-10-14 实测：空
+// 进稿器会交回一张全白页，设备不报错，于是白纸订单成立）。后端的空白页
+// 判据（blank_scan）现在已经兜住结果，这道提示就该老老实实每次都问。
+function continueCopyAnyway() {
+  copyAdfConfirm.value = false
+  copyAdfForce.value = true
+  startCopy()
+}
+
+// 用户确认「扫描出来的白纸我就是要」：带 forceBlank 重发。
+//
+// 同时带上 forceInput：能走到这一步的人，刚刚已经真的从这个放稿位置扫出了
+// 一张件（哪怕是白纸），设备若还在报「进稿器里没纸」就是它在误报，没必要
+// 让他再点一次「放稿确认」——两个 409 来回弹是最糟糕的循环。
+function continueBlankAnyway() {
+  copyBlankConfirm.value = false
+  copyBlankForce.value = true
+  copyAdfForce.value = true
+  startCopy()
+}
+
+async function startCopy() {
+  if (!copyCanStart.value) return
+  copying.value = true
+  copyAdfConfirm.value = false
+  copyBlankConfirm.value = false
+  try {
+    const resp = await apiFetch('/api/copy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        printer: printer.value,
+        color: copyColor.value,
+        inputSource: copyInput.value,
+        forceInput: copyAdfForce.value,
+        // 空白件的确认与放稿确认是两码事，各自只放开自己那一道闸。
+        forceBlank: copyBlankForce.value,
+        // 双面只在进稿器下有意义；玻璃板那一支后端会直接拒绝。
+        adfDuplex: copyInput.value === 'adf' && copyAdfDuplex.value,
+        duplexOut: copyDuplexOut.value,
+        copies: Math.max(1, Math.min(99, copyCopies.value || 1)),
+        paperSize: copyPaperSize.value
+      })
+    }, () => emit('logout'))
+    if (!resp.ok) {
+      // 两个 409 都表示「现场还没准备好」，不是请求写错了 —— 各给一个继续
+      // 的出口，而不是一条红 toast 就结束。
+      //
+      // 判定放在后端做：它能拿到设备的【当前】状态与真实的扫描结果，
+      // 而这里缓存的 copyStatus 可能是几秒前（甚至进页面时）的旧值。
+      if (resp.status === 409) {
+        const body = await resp.json().catch(() => null)
+        if (body?.code === 'adf_empty') {
+          copyAdfConfirm.value = true
+          return
+        }
+        if (body?.code === 'blank_scan') {
+          copyBlankConfirm.value = true
+          return
+        }
+        throw new Error(body?.error || resp.statusText)
+      }
+      throw new Error(await readError(resp))
+    }
+
+    if (billing.value.enabled) {
+      // 与 /api/orders 同形状：直接复用支付弹窗与批次轮询。
+      orderBatch.value = await readJSON(resp)
+      showPaymentModal.value = true
+      toast.add({
+        title: '扫描完成',
+        description: '付款后打印机将自动开始复印',
+        color: 'success',
+        icon: 'i-lucide-check-circle'
+      })
+      localStorage.setItem('last_printer', printer.value)
+    } else {
+      const j = await readJSON(resp)
+      toast.add({
+        title: '复印完成',
+        description: `共 ${j.pages || 1} 页 × ${j.copies || 1} 份，正在出纸`,
+        color: 'success',
+        icon: 'i-lucide-check-circle',
+        duration: 8000
+      })
+      localStorage.setItem('last_printer', printer.value)
+    }
+  } catch (e) {
+    toast.add({ title: '复印失败', description: e.message, color: 'error', icon: 'i-lucide-x-circle' })
+  } finally {
+    copying.value = false
+    // 两个 force 都只对本次提交有效，别让它们粘到下一次。
+    copyAdfForce.value = false
+    copyBlankForce.value = false
+    // 扫完重新探测一次状态：让「正忙/空闲」与设备同步。
+    loadCopyStatus()
   }
 }
 

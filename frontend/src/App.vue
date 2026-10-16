@@ -25,7 +25,7 @@
               :color="route.path === '/print' ? 'primary' : 'neutral'"
               size="xs"
               icon="i-lucide-printer"
-              @click="router.push('/print')"
+              @click="goPrint"
             >
               在线打印
             </UButton>
@@ -103,6 +103,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { clearSessionCache, updateSessionCache } from './router'
 import { apiFetch, readError, readJSON, setUnauthorizedHandler } from './utils/api'
 import { announcePaymentSettled } from './utils/paymentSignal'
+import { requestPrintHome } from './utils/printHomeSignal'
 import { clearPendingUpload } from './utils/pendingUpload'
 
 const router = useRouter()
@@ -136,6 +137,20 @@ const PROFILE_PATHS = ['/me', '/records', '/wallet', '/scheduled', '/admin', '/d
 const inProfileSection = computed(() =>
   PROFILE_PATHS.some((p) => route.path === p || route.path.startsWith(p + '/'))
 )
+
+// 顶栏「在线打印」的点击。
+//
+// ⚠️ 已经在 /print 时不能只靠 router.push：五个模式共用这一个路由，
+// 用户进了「标准打印」后地址栏还是 /print，此时 push('/print') 是一次
+// 重复导航 —— Vue Router 忽略它，页面不动，用户判定「按钮坏了」。
+// 这种情况要改成广播，让页面自己退回落地页（见 utils/printHomeSignal.js）。
+function goPrint() {
+  if (route.path === '/print') {
+    requestPrintHome()
+    return
+  }
+  router.push('/print')
+}
 
 async function loadVersion() {
   try {

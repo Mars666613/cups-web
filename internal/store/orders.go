@@ -45,6 +45,9 @@ const (
 	// OrderSourcePull 是刷卡取件：提交时只暂存，刷卡才送印。
 	// 金额恒为 0，永不进入任何退款路径（见 startPullPrintForOrder）。
 	OrderSourcePull = "pull"
+	// OrderSourceCopy 是远程复印：文件来自扫描仪（eSCL）而不是用户上传，
+	// 其余流水线（转换、计价、支付、送印）与 web 下单完全一致。
+	OrderSourceCopy = "copy"
 )
 
 // PrintOrder 是一条打印订单。
@@ -290,13 +293,36 @@ func SumPendingAmountByBatch(ctx context.Context, tx *sql.Tx, batchID string) (i
 //
 // 🚫 只能在【写事务】里调用，PG 对只读事务里的 FOR UPDATE 直接报错。
 // 所以这个锁不能并进上面那个函数 —— startOnlinePayment 是只读事务里调的。
+//
+// 🚫🚫 更不能写成 `SELECT SUM(...) ... FOR UPDATE`：PG 报
+// 「FOR UPDATE不能用于聚合函数中」，SQL 直接执行失败。这不是边角情形 ——
+// 这条 SQL 是【余额支付那条路】的唯一入口，一旦这样写，余额支付就
+// 100% 返回 500 failed to pay，而在线支付（走不加锁的上面那版）毫发无伤，
+// 现象极容易被误判成「余额功能没做」。历史故障。
+//
+// 锁与聚合必须分开：先把待支付订单的行锁住并取回金额，再在本地求和。
+// 一个批次的订单数是个位数，逐行扫码的代价可以忽略。
 func SumPendingAmountByBatchLocked(ctx context.Context, tx *sql.Tx, batchID string) (int64, error) {
-	var total sql.NullInt64
-	if err := tx.QueryRowContext(ctx, sumPendingAmountSQL+" FOR UPDATE",
-		batchID, OrderStatusPendingPayment).Scan(&total); err != nil {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT amount_cents FROM print_orders
+		 WHERE batch_id = $1 AND status = $2 ORDER BY id FOR UPDATE`,
+		batchID, OrderStatusPendingPayment)
+	if err != nil {
 		return 0, err
 	}
-	return total.Int64, nil
+	defer rows.Close()
+
+	var total int64
+	for rows.Next() {
+		var amount int64
+		if err := rows.Scan(&amount); err != nil {
+			return 0, err
+		}
+		total += amount
+	}
+	// 一行都没有时 total 保持 0，与上面 SUM 返回 NULL 时取 Int64 的语义一致
+	// （调用方据此判断「没有待支付订单」）。
+	return total, rows.Err()
 }
 
 // ─── 状态迁移 ──────────────────────────────────────────────────────────

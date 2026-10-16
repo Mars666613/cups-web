@@ -4,7 +4,21 @@
 .drivers
 
 bin/
-frontend/dist/
+# 前端构建产物。
+#
+# ⚠️ 但 index.html 是【例外，而且必须是例外】：服务端用
+# `//go:embed dist/**` 把前端嵌进二进制，所以 dist/ 里必须有文件才能编译。
+# 全忽略的话，刚克隆下来跑 `go build ./...` 会报
+# `pattern dist/**: no matching files found` —— 一句话指不到根因。
+# 仓库里的 index.html 是个占位页（写着「前端还没构建」），
+# 让干净克隆能直接编译，而且编译出来的二进制会明说该怎么办。
+#
+# 跑过 `make frontend` 之后 vite 会覆盖它（emptyOutDir），于是
+# `git status` 显示它被改过 —— 那是正常的，🚫 不要把构建产物提交回去：
+# 里面引用的是 hash 过的 assets 文件名，而那些文件不在仓库里，
+# 提交上去只会让下一个克隆的人拿到一个打不开的页面。
+frontend/dist/*
+!frontend/dist/index.html
 node_modules/
 
 # Editor / OS
@@ -19,9 +33,27 @@ node_modules/
 # 全局 gitignore 也挡了一份，但那条不随仓库走，换台机器克隆再提交就会漏。
 .claude/
 
+# AI 协作工具的本地工作记忆（WorkBuddy 等）。
+#
+# ⚠️ 这是【排障日志】，不是源码：里面按主题记了真机 IP、现场设备型号、
+# 内部分析过程。真实打印机地址就是先写在源码注释里、又被抄进这些日志的。
+# 源码里的地址已经换成占位符，日志若不排除，公开仓库等于把它们重新发一遍。
+.workbuddy/
+
 # Environment
 .env
 .env.local
+
+# 自己往 docker-fonts/ 里放的 Windows 中文字体。
+#
+# ⚠️ 这道保险是【故意的】：SimSun/SimHei/SimKai/SimFang 是微软/中易的版权
+# 字体，不允许公开分发。本地放进去构建自己的镜像是可以的，但一旦
+# `git add` 回来，这个仓库就又变成在公开分发版权字体了 —— 而那种提交
+# 极容易顺手做出来（构建完之后 `git add -A` 就带上了）。
+# 详见 docker-fonts/README.md。
+docker-fonts/*.ttf
+docker-fonts/*.ttc
+docker-fonts/*.otf
 
 # Logs and coverage
 .cache/
@@ -31,7 +63,10 @@ coverage/
 # Build outputs
 data/
 uploads/
+# 本机 go build 出的可执行文件：Linux/macOS 无后缀，Windows 是 .exe。
+# 48MB 级、与平台绑定，而且会带上构建时的本地模块路径 —— 绝不能进仓库。
 /server
+/server.exe
 # 调试器（GoLand / VSCode）生成的二进制，60MB 级，且与平台绑定。
 __debug_bin*
 

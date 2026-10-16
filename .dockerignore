@@ -3,3 +3,7 @@
 .uploads
 .drivers
 ofd-converter/target/
+
+# AI 协作工具的本地工作记忆：按主题记了现场真机 IP 与内部分析过程，
+# 不该跟着构建上下文（Dockerfile 里有 `COPY . .`）一起进构建层。
+.workbuddy/

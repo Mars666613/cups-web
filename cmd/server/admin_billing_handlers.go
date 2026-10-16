@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 
 	"cups-web/internal/pricing"
@@ -40,21 +41,32 @@ type pricesPayload struct {
 // loadPriceView 读出价目视图。管理端与用户端共用 —— 两边看到的必须是同一份数据，
 // 否则用户按 A 价预期、系统按 B 价扣款，是必然的投诉来源。
 func loadPriceView(ctx context.Context) (map[string]interface{}, error) {
-	var enabled, fallback int64
-	var rows []store.PriceRule
-
+	var view map[string]interface{}
 	err := appStore.WithTx(ctx, true, func(tx *sql.Tx) error {
 		var err error
-		if enabled, err = store.GetSettingInt(ctx, tx, store.SettingBillingEnabled, 0); err != nil {
-			return err
-		}
-		if fallback, err = loadFallbackUnitCents(ctx, tx); err != nil {
-			return err
-		}
-		rows, err = store.ListPriceRules(ctx, tx)
+		view, err = loadPriceViewTx(ctx, tx)
 		return err
 	})
-	if err != nil {
+	return view, err
+}
+
+// loadPriceViewTx 是 loadPriceView 的事务内版本。
+//
+// 单独抽出来是为了给审计用：PUT 里要读「改之前」和「改之后」两次，而
+// loadPriceView 自己开事务 —— 在已有事务里调它会另起一个连接，读到的
+// 不是本事务的一致快照。
+func loadPriceViewTx(ctx context.Context, tx *sql.Tx) (map[string]interface{}, error) {
+	var enabled, fallback int64
+	var rows []store.PriceRule
+	var err error
+
+	if enabled, err = store.GetSettingInt(ctx, tx, store.SettingBillingEnabled, 0); err != nil {
+		return nil, err
+	}
+	if fallback, err = loadFallbackUnitCents(ctx, tx); err != nil {
+		return nil, err
+	}
+	if rows, err = store.ListPriceRules(ctx, tx); err != nil {
 		return nil, err
 	}
 
@@ -120,7 +132,21 @@ func adminAdjustBalanceHandler(w http.ResponseWriter, r *http.Request) {
 			Operator:       operator,
 			Note:           note,
 		})
-		return err
+		if err != nil {
+			return err
+		}
+		// 手工调额本来就会写一条 admin_adjust 流水，但流水表回答的是
+		// 「钱怎么动的」，审计表回答的是「谁动了哪个人」。管理员查「谁把
+		// 张三的余额加了 100」时只会去一个地方找 —— 把这件事放在同一个
+		// 列表里，比让他记住「余额看流水、开关看审计」强。
+		return recordAudit(ctx, tx, operator, store.AuditBalanceAdjust,
+			fmt.Sprintf("user#%d %s", user.ID, user.Username),
+			fmt.Sprintf("余额 %+d 分（%s → %s）：%s",
+				payload.AmountCents, formatYuan(user.BalanceCents), formatYuan(balanceAfter), note),
+			auditChange{
+				Field: "amountCents", Text: fmt.Sprintf("%+d 分", payload.AmountCents),
+				Before: user.BalanceCents, After: balanceAfter,
+			})
 	})
 	if err != nil {
 		switch {
@@ -152,6 +178,12 @@ func adminUpdatePricesHandler(w http.ResponseWriter, r *http.Request) {
 
 	err := appStore.WithTx(r.Context(), false, func(tx *sql.Tx) error {
 		ctx := r.Context()
+
+		// 「改之前」取本事务内的一致快照（理由同 adminUpdateSettingsHandler）。
+		beforeView, err := loadPriceViewTx(ctx, tx)
+		if err != nil {
+			return err
+		}
 
 		// 先把本次要写入的价目解析校验出来（nil 指针 = 不改价目表）。
 		var newRules []pricing.Rule
@@ -240,7 +272,13 @@ func adminUpdatePricesHandler(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 		}
-		return nil
+
+		afterView, err := loadPriceViewTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		return recordAudit(ctx, tx, sessionUsername(r), store.AuditPriceUpdate,
+			"全局", "", priceAuditChanges(beforeView, afterView)...)
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -347,4 +385,80 @@ func boolToInt(b bool) int64 {
 		return 1
 	}
 	return 0
+}
+
+// priceAuditChanges 比较前后两份价目视图，返回变更项。
+//
+// 价目表是【整表替换】（ReplacePriceRules 先删后插），所以「第 2 条单价从
+// 20 分改成 25 分」在这里只能表现为「整张表变了」。刻意不去猜是哪一条被改：
+// 猜错的审计记录比不猜更糟 —— 它看起来是确定的。两份完整价目都进 JSON，
+// 列表页展开就能逐条比对；摘要只给条数，让人一眼看出「这次动过价目」。
+func priceAuditChanges(before, after map[string]interface{}) []auditChange {
+	var out []auditChange
+
+	bEnabled, _ := before["enabled"].(bool)
+	aEnabled, _ := after["enabled"].(bool)
+	if bEnabled != aEnabled {
+		out = append(out, auditChange{
+			Field: "enabled", Text: fmt.Sprintf("计费开关 %s → %s", onOff(bEnabled), onOff(aEnabled)),
+			Before: bEnabled, After: aEnabled,
+		})
+	}
+
+	bFallback := toInt64(before["fallbackUnitCents"])
+	aFallback := toInt64(after["fallbackUnitCents"])
+	if bFallback != aFallback {
+		out = append(out, auditChange{
+			Field:  "fallbackUnitCents",
+			Text:   fmt.Sprintf("兜底单价 %s → %s", formatYuan(bFallback), formatYuan(aFallback)),
+			Before: bFallback, After: aFallback,
+		})
+	}
+
+	bRules := toPriceRulePayloads(before["rules"])
+	aRules := toPriceRulePayloads(after["rules"])
+	if priceRuleSetKey(bRules) != priceRuleSetKey(aRules) {
+		out = append(out, auditChange{
+			Field:  "rules",
+			Text:   fmt.Sprintf("价目条目 %d 条 → %d 条", len(bRules), len(aRules)),
+			Before: bRules, After: aRules,
+		})
+	}
+	return out
+}
+
+func toInt64(v interface{}) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	default:
+		return 0
+	}
+}
+
+func toPriceRulePayloads(v interface{}) []priceRulePayload {
+	switch rows := v.(type) {
+	case []priceRulePayload:
+		return rows
+	case []store.PriceRule:
+		return mapPriceRulePayloads(rows)
+	default:
+		return nil
+	}
+}
+
+// priceRuleSetKey 把一份价目表归一成与顺序无关的字符串，用来判断「真的变了」。
+//
+// 不直接比切片：ReplacePriceRules 是删了重插，两次提交同样内容也可能因为
+// 查询顺序不同而列出不同次序 —— 那样审计里会留下一条「2 条 → 2 条」的
+// 假变更记录，比没有记录更让人困惑。
+func priceRuleSetKey(rows []priceRulePayload) string {
+	keys := make([]string, 0, len(rows))
+	for _, r := range rows {
+		keys = append(keys, fmt.Sprintf("%s=%d", priceRuleKey(r.IsColor, r.PaperSize, r.PaperType), r.UnitCents))
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
 }

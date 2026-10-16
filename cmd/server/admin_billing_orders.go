@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -158,7 +159,16 @@ func adminRefundOrderHandler(w http.ResponseWriter, r *http.Request) {
 
 		refunded = order.AmountCents
 		userID = order.UserID
-		return nil
+
+		// 退款也是「钱怎么动的」，同样进审计：钱包流水里能查到这一笔，
+		// 但那里没有「谁按的按钮」。两处都有才叫闭环。
+		return recordAudit(ctx, tx, operator, store.AuditOrderRefund,
+			fmt.Sprintf("订单 #%d", id),
+			fmt.Sprintf("退款 %s 到 user#%d：%s", formatYuan(order.AmountCents), order.UserID, reason),
+			auditChange{
+				Field: "refundedCents", Text: fmt.Sprintf("退款 %s", formatYuan(order.AmountCents)),
+				Before: int64(0), After: order.AmountCents,
+			})
 	})
 
 	if err != nil {

@@ -2,17 +2,17 @@
 
 <div align="center">
 
-[![GitHub Release](https://img.shields.io/github/v/release/hanxi/cups-web?style=flat-square&logo=github&color=blue)](https://github.com/hanxi/cups-web/releases)
-[![Docker Pulls](https://img.shields.io/docker/pulls/hanxi/cups-web?style=flat-square&logo=docker)](https://hub.docker.com/r/hanxi/cups-web)
-[![Docker Image Size](https://img.shields.io/docker/image-size/hanxi/cups-web/latest?style=flat-square&logo=docker&color=066da5)](https://hub.docker.com/r/hanxi/cups-web)
-[![GitHub Stars](https://img.shields.io/github/stars/hanxi/cups-web?style=flat-square&logo=github)](https://github.com/hanxi/cups-web/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/hanxi/cups-web?style=flat-square&logo=github)](https://github.com/hanxi/cups-web/network/members)
-[![GitHub Issues](https://img.shields.io/github/issues/hanxi/cups-web?style=flat-square&logo=github)](https://github.com/hanxi/cups-web/issues)
-[![GitHub Last Commit](https://img.shields.io/github/last-commit/hanxi/cups-web?style=flat-square&logo=github)](https://github.com/hanxi/cups-web/commits)
-[![GitHub Downloads](https://img.shields.io/github/downloads/hanxi/cups-web/total?style=flat-square&logo=github&color=success)](https://github.com/hanxi/cups-web/releases)
-[![License](https://img.shields.io/github/license/hanxi/cups-web?style=flat-square&color=blue)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/Mars666613/cups-web?style=flat-square&logo=github&color=blue)](https://github.com/Mars666613/cups-web/releases)
+[![Docker Pulls](https://img.shields.io/docker/pulls/Mars666613/cups-web?style=flat-square&logo=docker)](https://hub.docker.com/r/Mars666613/cups-web)
+[![Docker Image Size](https://img.shields.io/docker/image-size/Mars666613/cups-web/latest?style=flat-square&logo=docker&color=066da5)](https://hub.docker.com/r/Mars666613/cups-web)
+[![GitHub Stars](https://img.shields.io/github/stars/Mars666613/cups-web?style=flat-square&logo=github)](https://github.com/Mars666613/cups-web/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/Mars666613/cups-web?style=flat-square&logo=github)](https://github.com/Mars666613/cups-web/network/members)
+[![GitHub Issues](https://img.shields.io/github/issues/Mars666613/cups-web?style=flat-square&logo=github)](https://github.com/Mars666613/cups-web/issues)
+[![GitHub Last Commit](https://img.shields.io/github/last-commit/Mars666613/cups-web?style=flat-square&logo=github)](https://github.com/Mars666613/cups-web/commits)
+[![GitHub Downloads](https://img.shields.io/github/downloads/Mars666613/cups-web/total?style=flat-square&logo=github&color=success)](https://github.com/Mars666613/cups-web/releases)
+[![License](https://img.shields.io/github/license/Mars666613/cups-web?style=flat-square&color=blue)](LICENSE)
 
-[![Go Version](https://img.shields.io/github/go-mod/go-version/hanxi/cups-web?style=flat-square&logo=go)](https://golang.org)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/Mars666613/cups-web?style=flat-square&logo=go)](https://golang.org)
 [![Vue 3](https://img.shields.io/badge/Vue-3.5-4FC08D?style=flat-square&logo=vue.js)](https://vuejs.org)
 [![Vite](https://img.shields.io/badge/Vite-7-646CFF?style=flat-square&logo=vite)](https://vitejs.dev)
 [![Nuxt UI](https://img.shields.io/badge/Nuxt%20UI-v4-00DC82?style=flat-square&logo=nuxt.js)](https://ui.nuxt.com)
@@ -20,26 +20,47 @@
 [![CUPS](https://img.shields.io/badge/CUPS-IPP-orange?style=flat-square)](https://www.cups.org)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?style=flat-square&logo=postgresql)](https://www.postgresql.org)
 
-🏠 [GitHub](https://github.com/hanxi/cups-web) • 🐳 [Docker Hub](https://hub.docker.com/r/hanxi/cups-web) • 📖 [开发文档](AGENTS.md) • 💬 [微信群](https://github.com/hanxi/cups-web/issues/36)
+🏠 [GitHub](https://github.com/Mars666613/cups-web) • 🐳 [Docker Hub](https://hub.docker.com/r/Mars666613/cups-web) • 📖 [开发文档](AGENTS.md) • 💬 [上游微信群](https://github.com/hanxi/cups-web/issues/36)
 
 </div>
 
-基于 CUPS 的网页版打印管理工具。通过浏览器上传文件、远程提交打印任务，支持多用户管理与打印记录追踪，适合家庭和小型办公室使用。
+> ### 关于本分支
+>
+> 本项目基于 **[hanxi/cups-web](https://github.com/hanxi/cups-web)** 二次开发。原项目由 [涵曦](https://github.com/hanxi) 创作，采用 MIT 许可证 —— 感谢原作者。
+>
+> 原项目面向「家用 / 小型办公室，把一台 USB 打印机变成网络打印服务」；本分支在其之上做了**较大改造**，功能方向转向**自助打印门店**：
+>
+> - **数据层**：SQLite → **PostgreSQL**，多台终端共享一个中心库
+> - **计费与支付**：价目表、兜底单价、余额账本（只增不改的流水）、计费开关；支付宝授权登录与扫码支付
+> - **自助终端**：刷卡取件机（`cmd/kiosk`，树莓派端）
+> - **运维**：设备异常告警（缺纸 / 卡纸 / 门未开 / 耗材不足 / 设备不可达，推送到企业微信、钉钉、飞书）与管理员操作审计
+> - **复印**：eSCL 扫描链路、PDF 空白页检测、驱动管理页
+>
+> 如果你要的是原项目那种「家用打印机共享」场景，请直接前往 [hanxi/cups-web](https://github.com/hanxi/cups-web)。
+
+基于 CUPS 的网页版打印管理工具。通过浏览器上传文件、远程提交打印任务，支持多用户管理与打印记录追踪 —— 既能用于家庭和小型办公室，也支持计费、支付与自助取件终端，可直接投放到自助打印门店。
 
 ## 📸 界面预览
 
+> 📷 **截图待补** —— 早先那一批已经删除：它们是**旧版界面**（管理端与打印记录页
+> 后来都重构过），而且用的是**真实使用中的文件名与打印机型号**，不适合放进公开仓库。
+>
+> 想自己看效果的话直接部署一个（下面有 Docker 一行命令），比截图准。
+
+<!-- 补好截图后替换掉上面这段：
 <div align="center">
 <table>
   <tr>
-    <td align="center"><img src="screenshots/print1.png" width="400" alt="文件上传"><br/><b>文件上传</b></td>
-    <td align="center"><img src="screenshots/print2.png" width="400" alt="打印机选择"><br/><b>打印机选择</b></td>
+    <td align="center"><img src="screenshots/print.png" width="400" alt="在线打印"><br/><b>在线打印</b></td>
+    <td align="center"><img src="screenshots/preview.png" width="400" alt="实时预览"><br/><b>实时预览</b></td>
   </tr>
   <tr>
-    <td align="center"><img src="screenshots/preview.png" width="400" alt="预览"><br/><b>实时预览</b></td>
     <td align="center"><img src="screenshots/admin.png" width="400" alt="管理后台"><br/><b>管理后台</b></td>
+    <td align="center"><img src="screenshots/result.png" width="400" alt="取件提示"><br/><b>取件提示</b></td>
   </tr>
 </table>
 </div>
+-->
 
 ## ✨ 功能特性
 
@@ -186,7 +207,7 @@ docker exec cups driver-remove canon-ufr2
 ```yaml
 services:
   cups:
-    image: hanxi/cups-web:latest
+    image: Mars666613/cups-web:latest
     container_name: cups
     user: root
     hostname: CUPS
@@ -218,10 +239,10 @@ services:
 也可直接下载仓库内的 `docker-compose.yml`：
 
 ```bash
-wget https://raw.githubusercontent.com/hanxi/cups-web/master/docker-compose.yml
+wget https://raw.githubusercontent.com/Mars666613/cups-web/main/docker-compose.yml
 ```
 
-> 💡 镜像标签：`latest` = 最新正式发行版（v* tag）；`dev` = master 分支最新构建（每次 push 更新，尝鲜用）。`docker-compose.yml` 默认用 `latest`，想试 dev 版本时把 `image: hanxi/cups-web:latest` 改成 `image: hanxi/cups-web:dev` 即可。
+> 💡 镜像标签：`latest` = 最新正式发行版（v* tag）；`dev` = main 分支最新构建（每次 push 更新，尝鲜用）。`docker-compose.yml` 默认用 `latest`，想试 dev 版本时把 `image: Mars666613/cups-web:latest` 改成 `image: Mars666613/cups-web:dev` 即可。
 
 ### 2. 配置环境变量（可选）
 
@@ -287,7 +308,7 @@ docker exec cups driver-install canon-ufr2
 
 ### 1. 下载二进制
 
-从 [GitHub Releases](https://github.com/hanxi/cups-web/releases) 下载对应平台的二进制：
+从 [GitHub Releases](https://github.com/Mars666613/cups-web/releases) 下载对应平台的二进制：
 
 | 平台 | 架构 | 文件名 |
 | --- | --- | --- |
@@ -300,7 +321,7 @@ docker exec cups driver-install canon-ufr2
 | Windows | amd64 | `cups-web-windows-amd64.exe` |
 
 ```bash
-wget https://github.com/hanxi/cups-web/releases/latest/download/cups-web-linux-amd64
+wget https://github.com/Mars666613/cups-web/releases/latest/download/cups-web-linux-amd64
 chmod +x cups-web-linux-amd64
 ```
 
@@ -614,7 +635,7 @@ docker compose logs -f cups
 
 <div align="center">
 
-[![Star History Chart](https://star-history.dera.page/svg?repos=hanxi/cups-web&type=Date)](https://star-history.dera.page/#hanxi/cups-web&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=Mars666613/cups-web&type=Date)](https://star-history.dera.page/#Mars666613/cups-web&Date)
 
 如果这个项目对你有帮助，欢迎点击右上角的 ⭐ **Star** 让更多人发现它！
 
@@ -627,3 +648,7 @@ docker compose logs -f cups
 ## 📄 许可证
 
 本项目采用 MIT 许可证，详见 [LICENSE](LICENSE)。
+
+原项目 [hanxi/cups-web](https://github.com/hanxi/cups-web) 由涵曦创作，同样以 MIT 许可证发布。
+本分支在其基础上的修改部分，版权归 xinghuo（GitHub: [@Mars666613](https://github.com/Mars666613)）所有。按 MIT 许可证的要求，
+[LICENSE](LICENSE) 中同时保留了原作者与本分支的版权声明。

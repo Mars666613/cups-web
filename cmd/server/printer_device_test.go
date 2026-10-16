@@ -71,8 +71,8 @@ func TestDeviceURIOf(t *testing.T) {
 	if got := deviceURIOf(&ipp.PrinterInfo{Attributes: map[string]string{"other": "x"}}); got != "" {
 		t.Errorf("没有 device-uri 应返回空串，实际 %q", got)
 	}
-	info := &ipp.PrinterInfo{Attributes: map[string]string{"device-uri": "ipp://192.168.0.243/ipp/print"}}
-	if got := deviceURIOf(info); got != "ipp://192.168.0.243/ipp/print" {
+	info := &ipp.PrinterInfo{Attributes: map[string]string{"device-uri": "ipp://192.168.1.100/ipp/print"}}
+	if got := deviceURIOf(info); got != "ipp://192.168.1.100/ipp/print" {
 		t.Errorf("应取到 device-uri，实际 %q", got)
 	}
 }

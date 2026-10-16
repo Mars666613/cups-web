@@ -205,6 +205,11 @@ func main() {
 	protected.HandleFunc("/convert", convertHandler).Methods("POST")
 	protected.HandleFunc("/compose", composeHandler).Methods("POST")
 	protected.HandleFunc("/estimate", estimateHandler).Methods("POST")
+	// 远程复印（issue：复印功能）：状态探测 + 提交复印。
+	// 计费开启时提交返回的是待支付订单批次（与 /api/orders 同形状），
+	// 免费与取件模式下直接扫描送印。
+	protected.HandleFunc("/copy/status", copyStatusHandler).Methods("GET")
+	protected.HandleFunc("/copy", copyHandler).Methods("POST")
 	protected.HandleFunc("/print-records", printRecordsHandler).Methods("GET")
 	protected.HandleFunc("/print-records/{id:[0-9]+}/file", printRecordFileHandler).Methods("GET")
 	protected.HandleFunc("/print-records/{id:[0-9]+}/reprint", reprintHandler).Methods("POST")
@@ -256,6 +261,14 @@ func main() {
 	admin.HandleFunc("/orders", adminListOrdersHandler).Methods("GET")
 	admin.HandleFunc("/orders/{id:[0-9]+}/refund", adminRefundOrderHandler).Methods("POST")
 	admin.HandleFunc("/wallet-transactions", adminListWalletTransactionsHandler).Methods("GET")
+	// 管理操作审计：只读。写入没有 HTTP 入口 —— 它只能由业务改动顺带产生，
+	// 能单独调用的审计等于可以伪造的审计。
+	admin.HandleFunc("/audit", adminListAuditHandler).Methods("GET")
+	// 设备异常告警：列表只读；resolve 是「已知悉，别再提醒这一类」，
+	// test 用当前配置发一条测试消息（见 admin_device_alert_handlers.go）。
+	admin.HandleFunc("/device-events", adminListDeviceEventsHandler).Methods("GET")
+	admin.HandleFunc("/device-events/{id:[0-9]+}/resolve", adminResolveDeviceEventHandler).Methods("POST")
+	admin.HandleFunc("/device-events/test", adminTestAlertHandler).Methods("POST")
 	admin.HandleFunc("/cleanup", adminCleanupHandler).Methods("POST")
 	admin.HandleFunc("/drivers", adminListDriversHandler).Methods("GET")
 	admin.HandleFunc("/drivers/install", adminInstallDriverHandler).Methods("POST")
@@ -289,6 +302,11 @@ func main() {
 	// 订单巡检：补偿送印（已支付但没打成）、回收卡死的订单、
 	// 释放超时未支付的批次并回收其文件。
 	startOrderWorker(appStore, uploadDir)
+	// 设备异常巡检：缺纸 / 卡纸 / 门没关 / 耗材耗尽 / 设备不可达。
+	//
+	// 它防的是那条最贵的故障链：半夜卡纸 → 之后每一单都送印失败 → 自动退款 →
+	// 第二天才发现。默认关闭（alert_enabled=0），配置见系统设置。
+	startDeviceAlertWorker(appStore)
 
 	fmt.Println("listening on", addr)
 	log.Fatal(srv.ListenAndServe())

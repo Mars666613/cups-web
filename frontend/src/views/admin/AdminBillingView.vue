@@ -15,24 +15,23 @@
         <UButton size="xs" variant="outline" icon="i-lucide-refresh-cw" @click="loadPrices">重试</UButton>
       </div>
 
-      <div class="flex flex-wrap items-center gap-x-6 gap-y-3">
-        <label class="flex items-center gap-2 cursor-pointer">
-          <USwitch v-model="billing.enabled" />
-          <span class="text-sm font-medium">开启计费</span>
-        </label>
-        <div class="flex items-center gap-2">
-          <label class="text-sm">兜底单价</label>
-          <UInput type="number" step="0.01" min="0" v-model="billing.fallbackYuan" class="w-28" placeholder="0.00" />
-          <span class="text-sm text-muted">元/页（价目未命中时使用）</span>
+      <!-- ── 总开关 ──────────────────────────────────────────────────
+           独立于下面的价目表，改动即生效（与「启用刷卡取件」同一套）。
+           开关与价目是两件事：管理员想临时停收/恢复收费时，不该被要求
+           连价目表一起提交一次 —— 那个按钮一旦失效，开关也一起卡住。 -->
+      <div class="flex items-start gap-3">
+        <USwitch
+          v-model="billing.enabled"
+          :loading="savingToggle"
+          :disabled="!!loadError || savingToggle"
+          @update:model-value="toggleBilling"
+        />
+        <div class="flex-1">
+          <p class="font-medium">开启计费</p>
+          <p class="text-sm text-muted">
+            开启后用户提交打印要先付费才出纸；关闭则直接送印。与「刷卡取件」「访客模式」互斥。
+          </p>
         </div>
-        <UButton
-          class="ml-auto"
-          color="primary"
-          icon="i-lucide-save"
-          :loading="savingPrices"
-          :disabled="savingPrices || !!loadError"
-          @click="savePrices"
-        >保存计费设置</UButton>
       </div>
 
       <!-- 拦住「开了计费但什么都算 0 元」：那等于收款功能被静默关掉，
@@ -46,6 +45,22 @@
         title="价目未配置"
         description="计费已开启，但既没有价目也没有兜底单价，所有打印都会算成 0 元。请至少添加一条价目，或填一个大于 0 的兜底单价。"
       />
+
+      <div class="flex flex-wrap items-center gap-x-6 gap-y-3 mt-5 pt-5 border-t border-default">
+        <div class="flex items-center gap-2">
+          <label class="text-sm">兜底单价</label>
+          <UInput type="number" step="0.01" min="0" v-model="billing.fallbackYuan" class="w-28" placeholder="0.00" />
+          <span class="text-sm text-muted">元/页（价目未命中时使用）</span>
+        </div>
+        <UButton
+          class="ml-auto"
+          color="primary"
+          icon="i-lucide-save"
+          :loading="savingPrices"
+          :disabled="savingPrices || !!loadError"
+          @click="savePrices"
+        >保存价目</UButton>
+      </div>
 
       <div class="overflow-x-auto mt-4">
         <UTable :columns="priceColumns" :data="billing.rules">
@@ -94,6 +109,7 @@ const emit = defineEmits(['logout'])
 
 const loadError = ref('')
 const savingPrices = ref(false)
+const savingToggle = ref(false)
 
 // unitYuan 是 [UI 值]，存的是「元」的字符串；提交时才换算成「分」。
 const billing = ref({ enabled: false, fallbackYuan: '0.00', rules: [] })
@@ -158,6 +174,48 @@ async function loadPrices() {
   }
 }
 
+// 计费开关【独立提交】：PUT /api/admin/prices 的三个字段是「省略即不改」语义
+// （见 pricesPayload 的注释），所以只带 enabled 就能单独切换，不会碰价目表
+// 与兜底单价。管理员的意图是「先停掉收费」时，不该被要求连价目一起提交一次。
+//
+// 后端拿「这次修改【之后】的状态」做跨字段校验，所以这里能收到真正有用的
+// 拒绝理由（还没配价目 / 访客模式开着 / 刷卡取件开着），原样转给管理员即可。
+async function toggleBilling(value) {
+  savingToggle.value = true
+  try {
+    const resp = await fetch('/api/admin/prices', {
+      method: 'PUT',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': getCSRF()
+      },
+      body: JSON.stringify({ enabled: value })
+    })
+    if (!resp.ok) {
+      // ⚠️ 失败必须把开关拨回去。界面显示「已开启」而服务端没接受，
+      // 管理员会以为用户已经开始付费了 —— 这是最不能有的错觉。
+      billing.value.enabled = !value
+      toast.add({ title: '设置失败', description: await readError(resp), color: 'error', icon: 'i-lucide-x-circle' })
+      if (resp.status === 401) emit('logout')
+      return
+    }
+    toast.add({
+      title: value ? '已开启计费' : '已关闭计费',
+      description: value ? '用户提交打印后需先付费才会出纸' : '打印入口已恢复为直接送印',
+      color: 'success',
+      icon: 'i-lucide-check-circle'
+    })
+  } catch (e) {
+    billing.value.enabled = !value
+    toast.add({ title: '设置失败', description: `无法连接到服务端：${e.message || e}`, color: 'error', icon: 'i-lucide-x-circle' })
+  } finally {
+    savingToggle.value = false
+  }
+}
+
+// 保存价目表与兜底单价。【不传 enabled】—— 开关由 toggleBilling 单独负责，
+// 这里带上它会让「保存价目」顺带改写开关状态，两边打架时无从解释。
 async function savePrices() {
   savingPrices.value = true
   try {
@@ -170,7 +228,6 @@ async function savePrices() {
       unitCents: Math.round((Number(r.unitYuan) || 0) * 100)
     }))
     const payload = {
-      enabled: billing.value.enabled === true,
       fallbackUnitCents: Math.round((Number(billing.value.fallbackYuan) || 0) * 100),
       rules
     }
@@ -189,7 +246,7 @@ async function savePrices() {
       if (resp.status === 401) emit('logout')
       return
     }
-    toast.add({ title: '保存成功', description: '计费设置已更新', color: 'success', icon: 'i-lucide-check-circle' })
+    toast.add({ title: '已保存', description: '价目表已更新', color: 'success', icon: 'i-lucide-check-circle' })
     await loadPrices()
   } finally {
     savingPrices.value = false

@@ -11,6 +11,8 @@ export const ADMIN_SECTIONS = [
   { label: '打印记录', icon: 'i-lucide-file-text', to: '/admin/records', hint: '全站打印任务与文件下载' },
   { label: '打印订单', icon: 'i-lucide-receipt', to: '/admin/orders', hint: '计费订单与手工退款' },
   { label: '余额流水', icon: 'i-lucide-scroll-text', to: '/admin/wallet', hint: '账本审计，只增不改' },
+  { label: '操作审计', icon: 'i-lucide-history', to: '/admin/audit', hint: '谁改了什么、改前改后' },
+  { label: '设备告警', icon: 'i-lucide-bell-ring', to: '/admin/alerts', hint: '缺纸卡纸耗材、通知渠道' },
   { label: '计费设置', icon: 'i-lucide-wallet', to: '/admin/billing', hint: '计费开关、兜底单价、价目表' },
   { label: '取件终端', icon: 'i-lucide-scan-line', to: '/admin/kiosk', hint: '刷卡取件开关、终端与工牌绑定' },
   { label: '系统设置', icon: 'i-lucide-settings', to: '/admin/settings', hint: '清理、上传上限、访客模式、自定义 CSS' }

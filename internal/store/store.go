@@ -39,6 +39,22 @@ const (
 	// admin_handlers.go 的 adminUpdateSettingsHandler 里强制。
 	SettingPullModeEnabled = "pull_mode_enabled" // "0" 关闭时 /api/print 行为不变
 	SettingPullTTLHours    = "pull_ttl_hours"    // "72" 待取件任务保留多久（小时），过期即删文件
+
+	// 设备异常告警。见 schema.sql 的 device_events 与 cmd/server/device_alert.go。
+	//
+	// 默认【关闭】：开关打开而 webhook 没配，就是「明明配了告警却什么都没收到」，
+	// 比不告警更危险 —— 后者至少知道要靠自己盯。
+	SettingAlertEnabled = "alert_enabled" // "0"
+	// SettingAlertWebhookURL 为空表示只记事件、不外发（管理端页面上仍然看得到）。
+	SettingAlertWebhookURL = "alert_webhook_url"
+	// SettingAlertWebhookKind "auto" 时按 URL 主机名推断渠道消息格式
+	// （qyapi.weixin.qq.com → 企业微信，oapi.dingtalk.com → 钉钉，
+	// open.feishu.cn → 飞书），识别不出按通用 {"text": ...} 发。
+	SettingAlertWebhookKind = "alert_webhook_kind"
+	// SettingAlertRepeatMinutes 同一异常持续存在时多久重发一次提醒；0 = 只发首次。
+	SettingAlertRepeatMinutes = "alert_repeat_minutes"
+	// SettingAlertSupplyLowPercent 墨量/粉量低于这个百分比算「耗材不足」。
+	SettingAlertSupplyLowPercent = "alert_supply_low_percent"
 )
 
 type Store struct {

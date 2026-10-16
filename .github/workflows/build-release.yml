@@ -108,10 +108,10 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     needs: build
-    # 只在 v* tag 或 master 分支 push 时创建 Release；其他分支照常编译
-    # 但不创建——否则每个分支名都会变成一个同名 git 标签（尤其 master 会
-    # 与分支引用重名，git push 报 "src refspec master matches more than one"）。
-    if: ${{ github.event_name == 'push' && (github.ref_type == 'tag' || github.ref == 'refs/heads/master') }}
+    # 只在 v* tag 或 main 分支 push 时创建 Release；其他分支照常编译
+    # 但不创建——否则每个分支名都会变成一个同名 git 标签（尤其 main 会
+    # 与分支引用重名，git push 报 "src refspec main matches more than one"）。
+    if: ${{ github.event_name == 'push' && (github.ref_type == 'tag' || github.ref == 'refs/heads/main') }}
 
     steps:
       - name: Checkout
@@ -142,7 +142,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          # v* tag 推送时用 tag 名（vX.Y.Z）；master 分支推送统一用 dev，
+          # v* tag 推送时用 tag 名（vX.Y.Z）；main 分支推送统一用 dev，
           # 避免把分支名当成 git 标签名（与分支引用重名冲突）。
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
           name: Release ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}

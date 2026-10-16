@@ -441,7 +441,7 @@ func GetPrinterAttributes(printerURI string) (*PrinterInfo, error) {
 	httpReq.Header.Set("Accept", goipp.ContentType)
 
 	log.Printf("[ipp] sending HTTP POST to %q", printerURI)
-	resp, err := newSafeClient(dialTimeout).Do(httpReq)
+	resp, err := doQueryRetry(newSafeClient(queryTimeout), httpReq, 2)
 	if resp != nil {
 		defer resp.Body.Close()
 		log.Printf("[ipp] HTTP response status: %s", resp.Status)
@@ -630,7 +630,7 @@ func listPrintersIPP(hostOnly string) ([]Printer, error) {
 	httpReq.Header.Set("Content-Type", goipp.ContentType)
 	httpReq.Header.Set("Accept", goipp.ContentType)
 
-	resp, err := newSafeClient(dialTimeout).Do(httpReq)
+	resp, err := doQueryRetry(newSafeClient(queryTimeout), httpReq, 2)
 	if err != nil {
 		return nil, fmt.Errorf("http post: %w", err)
 	}
@@ -691,7 +691,7 @@ func listPrintersHTML(hostOnly string) ([]Printer, error) {
 	if err := validatePrinterURI(listURL); err != nil {
 		return nil, err
 	}
-	resp, err := newSafeClient(dialTimeout).Get(listURL)
+	resp, err := newSafeClient(queryTimeout).Get(listURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch printers page: %w", err)
 	}
@@ -835,6 +835,8 @@ func GetJobState(printerURI string, jobID int) (JobStatus, bool, error) {
 	httpReq.Header.Set("Content-Type", goipp.ContentType)
 	httpReq.Header.Set("Accept", goipp.ContentType)
 
+	// 保持 dialTimeout：订单巡检用它判定「这一单到底打出来没有」，
+	// 结论直接关联退款，宁可多等也不要用短超时把它误判成失败。
 	resp, err := newSafeClient(dialTimeout).Do(httpReq)
 	if err != nil {
 		return JobStatus{}, false, fmt.Errorf("http post: %w", err)
@@ -957,7 +959,7 @@ func ListActiveJobs(host string) ([]Job, error) {
 	httpReq.Header.Set("Content-Type", goipp.ContentType)
 	httpReq.Header.Set("Accept", goipp.ContentType)
 
-	resp, err := newSafeClient(dialTimeout).Do(httpReq)
+	resp, err := doQueryRetry(newSafeClient(queryTimeout), httpReq, 2)
 	if err != nil {
 		return nil, fmt.Errorf("http post: %w", err)
 	}
@@ -1071,7 +1073,7 @@ func CancelJob(printerURI string, jobID int, username string) error {
 	}
 	httpReq.Header.Set("Content-Type", goipp.ContentType)
 	httpReq.Header.Set("Accept", goipp.ContentType)
-
+	// 保持 dialTimeout：取消不是只读查询，超时后重试的语义不明。
 	resp, err := newSafeClient(dialTimeout).Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("http post: %w", err)

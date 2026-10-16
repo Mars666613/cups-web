@@ -124,8 +124,9 @@
       </template>
     </UModal>
 
-    <!-- 充值：这里只负责选金额，二维码在弹窗里 -->
-    <UCard v-if="paymentMethods.length > 0">
+    <!-- 充值：这里只负责选金额，二维码在弹窗里。
+         id 供「去充值」把这一块滚进视野用（见 onResumeGoTopup）。 -->
+    <UCard id="wallet-topup" v-if="paymentMethods.length > 0">
       <template #header>
         <h2 class="text-lg font-bold flex items-center gap-2">
           <UIcon name="i-lucide-plus-circle" class="w-5 h-5" />
@@ -222,13 +223,18 @@
     <!-- 订单 -->
     <UCard>
       <template #header>
-        <div class="flex items-center justify-between gap-2 cursor-pointer select-none" @click="ordersExpanded = !ordersExpanded">
+        <div class="flex items-center justify-between gap-2 cursor-pointer select-none" @click="toggleOrders">
           <h2 class="text-lg font-bold flex items-center gap-2 min-w-0">
             <UIcon name="i-lucide-receipt" class="w-5 h-5 shrink-0" />
             打印订单
-            <!-- 折叠时补一行条数：收起之后也得能看出里面有没有东西，
+            <!-- 有待支付的必须【在收起状态下也看得见】：用户来这一页常常
+                 就是为了把那笔没付成的单付掉，藏进折叠区等于让他找不到。 -->
+            <UBadge v-if="pendingPayCount > 0" color="warning" variant="subtle" size="sm">
+              {{ pendingPayCount }} 笔待支付
+            </UBadge>
+            <!-- 没有待支付时补一行条数：收起之后也得能看出里面有没有东西，
                  否则用户只能靠展开来确认，等于没省事。 -->
-            <span v-if="!ordersExpanded && orders.length > 0" class="text-xs font-normal text-muted truncate">
+            <span v-else-if="!ordersExpanded && orders.length > 0" class="text-xs font-normal text-muted truncate">
               共 {{ orders.length }} 笔
             </span>
           </h2>
@@ -273,13 +279,34 @@
                     {{ payMethodText(o.payMethod) }}
                   </span>
                   <span v-if="o.jobId">任务 {{ o.jobId }}</span>
+                  <!-- 待支付的订单要说清「什么时候之前还来得及付」。
+                       用户回头看到一笔待支付，第一反应是「还能付吗」——
+                       这里没有倒数，过期后这条订单会被后台回收掉。 -->
+                  <span v-if="o.status === 'pending_payment' && o.expiresAt" class="text-warning">
+                    请在 {{ formatTime(o.expiresAt) }} 前支付
+                  </span>
                 </div>
                 <div v-if="o.error" class="text-xs text-error mt-1">{{ o.error }}</div>
                 <div v-if="o.refundedCents > 0" class="text-xs text-success mt-1">
                   已退款 {{ formatCents(o.refundedCents) }}（退回余额）
                 </div>
               </div>
-              <div class="text-right shrink-0 font-medium">{{ formatCents(o.amountCents) }}</div>
+              <div class="text-right shrink-0">
+                <div class="font-medium">{{ formatCents(o.amountCents) }}</div>
+                <!-- ── 待支付的订单必须有一条【回到付款界面】的路 ──
+                     没有它，用户一旦离开支付弹窗（余额不够去充值、点去充值、
+                     手滑关掉窗口），这笔订单就只剩「等到 15 分钟后过期作废」，
+                     唯一出路是重新下一单 —— 而复印要重新去机器上放一次原件、
+                     扫一遍，等于白干一遍活。 -->
+                <UButton
+                  v-if="o.status === 'pending_payment'"
+                  size="xs"
+                  color="primary"
+                  class="mt-1.5"
+                  :loading="resumingBatch === o.batchId"
+                  @click="resumePay(o)"
+                >去支付</UButton>
+              </div>
             </div>
           </div>
         </div>
@@ -337,11 +364,28 @@
         </div>
       </div>
     </UCard>
+
+    <!-- ── 继续支付：订单列表里点「去支付」进来的那笔批次 ──────────────
+         复用打印页/复印页那一个支付弹窗 —— 支付方式、二维码、到账轮询、
+         成功页都在里面，没必要在这儿再写一套（写两套必然漂）。
+
+         allow-cancel=false：这个入口的用户是【来付钱的】，点「取消」只该
+         关掉弹窗，不该把订单连同扫描件一起作废。 -->
+    <PaymentModal
+      v-if="payBatch"
+      v-model:open="showPayModal"
+      :batch="payBatch"
+      :payment-methods="paymentMethods"
+      :allow-cancel="false"
+      @paid="onResumePaid"
+      @done="onResumeDone"
+      @go-wallet="onResumeGoTopup"
+    />
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { apiFetch, readError, readJSON } from '../utils/api'
 import { paymentSettledTick } from '../utils/paymentSignal'
@@ -354,9 +398,11 @@ import {
 import { payChannel } from '../utils/device'
 import PaymentPanel from '../components/PaymentPanel.vue'
 import PayIcon from '../components/PayIcon.vue'
+import PaymentModal from '../components/print/PaymentModal.vue'
 
 const emit = defineEmits(['logout'])
 const route = useRoute()
+const toast = useToast()
 
 const loading = ref(true)
 // 拉取失败的原因。非空时页面顶部弹一条错误 —— 因为下面的卡片在失败时
@@ -376,6 +422,91 @@ const ordersExpanded = ref(false)
 const txExpanded = ref(false)
 const listMaxHeight = '30rem'
 const orders = ref([])
+
+// 用户手动开合过订单列表之后，就不再替他自动展开（见 load 里的最后一段）。
+const ordersTouched = ref(false)
+
+// ─── 继续支付一笔挂着的订单 ────────────────────────────────────
+const payBatch = ref(null)
+const showPayModal = ref(false)
+// 正在取哪一批的详情（按钮上的 loading），空串表示没有请求在飞。
+const resumingBatch = ref('')
+
+const pendingPayCount = computed(() => orders.value.filter(o => o.status === 'pending_payment').length)
+
+function toggleOrders() {
+  ordersTouched.value = true
+  ordersExpanded.value = !ordersExpanded.value
+}
+
+// resumePay 打开某笔待支付订单所在批次的支付窗。
+//
+// ⚠️ 必须按 batchId 【重新取一次】批次，不能直接拿列表里那份数据拼。
+// 列表是页面加载时的快照，可能已经过去十几分钟：订单也许早已过期、
+// 被后台回收、甚至在别处付掉了。拿旧数据去开支付窗，用户会对着一个
+// 早就失效的订单反复点「确认支付」。这里以服务端当下这次回答为准。
+async function resumePay(o) {
+  if (resumingBatch.value) return
+  resumingBatch.value = o.batchId
+  try {
+    const resp = await apiFetch(`/api/orders/batch/${o.batchId}`, {}, () => emit('logout'))
+    if (!resp.ok) {
+      toast.add({
+        title: '无法继续支付',
+        description: await readError(resp),
+        color: 'error',
+        icon: 'i-lucide-x-circle'
+      })
+      await load()
+      return
+    }
+    const batch = await readJSON(resp)
+    // 已经全部付掉/过期/取消的批次不再开窗 —— 弹窗会渲染成一个没有待支付
+    // 订单的「合计 ¥0.00」，比一句明确的提示更让人困惑。
+    if (!(batch?.orders || []).some(x => x.status === 'pending_payment')) {
+      toast.add({
+        title: '这笔订单已经不能支付了',
+        description: '它可能已过期或被取消，列表已刷新。',
+        color: 'warning',
+        icon: 'i-lucide-alert-triangle'
+      })
+      await load()
+      return
+    }
+    payBatch.value = batch
+    showPayModal.value = true
+  } catch (e) {
+    toast.add({
+      title: '无法继续支付',
+      description: e?.message || String(e),
+      color: 'error',
+      icon: 'i-lucide-x-circle'
+    })
+  } finally {
+    resumingBatch.value = ''
+  }
+}
+
+// 付款成功：订单会立刻变成「已支付/打印中」，列表与余额都得跟着变。
+// 弹窗自己会停在成功页，不在这儿关。
+async function onResumePaid() {
+  await load()
+}
+
+// 成功页结束（倒计时走完或点「返回」）：收尾并卸载弹窗。
+async function onResumeDone() {
+  showPayModal.value = false
+  payBatch.value = null
+  await load()
+}
+
+// 「去充值」：用户就在钱包页上，不必跳转 —— 关掉弹窗，把充值卡滚进视野。
+function onResumeGoTopup() {
+  showPayModal.value = false
+  nextTick(() => {
+    document.getElementById('wallet-topup')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  })
+}
 
 // ─── 充值 ───────────────────────────────────────────────
 const amountYuan = ref('10')
@@ -495,6 +626,14 @@ async function load() {
   } catch (e) {
     loadError.value = e?.message || String(e)
   } finally {
+    // 有待支付的订单就默认展开，把「去支付」摆到台面上。
+    //
+    // 用户来钱包页十有八九就是为了把那笔没付成的单付掉（余额不够、手滑关窗、
+    // 先去充值回来了）。让他先点一次折叠标题才看得见入口，等于把路藏起来。
+    // 他自己开合过之后就尊重他的选择，不再自动动它。
+    if (!ordersTouched.value && orders.value.some(o => o.status === 'pending_payment')) {
+      ordersExpanded.value = true
+    }
     loading.value = false
   }
 }

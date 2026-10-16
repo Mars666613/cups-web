@@ -67,6 +67,17 @@
                 >去充值</UButton>
               </label>
             </div>
+            <!-- 余额不足时把【出路】写出来。
+                 在线渠道本来就不需要余额，用户没理由先去充值再回来付 ——
+                 但不说这一句，他看到禁用掉的「确认支付」只会以为整个支付坏了。 -->
+            <UAlert
+              v-if="method === 'balance' && insufficient"
+              color="warning"
+              variant="soft"
+              icon="i-lucide-wallet"
+              title="余额不足"
+              description="可以点「去充值」入账后再付，也可以直接改选上面的在线支付方式（如支付宝），那条路不需要余额。"
+            />
             <p class="text-xs text-muted">
               支付成功后立即送印。若打印失败，费用会<b>全额退回余额</b>——在线支付渠道的原路退款需人工处理，因此统一退到余额。
             </p>
@@ -115,12 +126,14 @@
             <!-- 成功页自带「返回」按钮，这里不再重复 -->
           </template>
           <template v-else-if="!done">
-            <UButton variant="ghost" :disabled="paying" @click="closeAndCancel">取消</UButton>
+            <UButton variant="ghost" :disabled="paying" @click="onCancelClick">
+              {{ allowCancel ? '取消' : '关闭' }}
+            </UButton>
             <UButton
               v-if="!onlineCred"
               color="primary"
               :loading="paying"
-              :disabled="paying || insufficient"
+              :disabled="confirmDisabled"
               @click="onConfirm"
             >确认支付 {{ formatCents(totalAmountCents) }}</UButton>
           </template>
@@ -147,7 +160,17 @@ const props = defineProps({
   // 下单响应：{ batchId, orders, totalAmountCents, balanceCents, expiresAt }
   batch: { type: Object, default: null },
   // 可用的在线渠道，如 ['mock']；为空时只提供余额支付
-  paymentMethods: { type: Array, default: () => [] }
+  paymentMethods: { type: Array, default: () => [] },
+  // 点「取消」时是否顺带【作废】这一批订单。
+  //
+  // 刚下完单就弹出这个窗时（打印页、复印页），取消 = 反悔不打，
+  // 顺手把订单作废、文件回收，是对的。
+  //
+  // 但从「我的钱包 → 打印订单」进来补付时不是：用户点「取消」多半只是想
+  // 关掉弹窗（比如先去充值，或者先去看一眼余额）。这里若沿用同一条路，
+  // 他点一下「取消」就把订单连同扫描件一起作废了 —— 而他本来是想付钱的。
+  // 所以那个入口传 false，按钮文案也随之变成「关闭」。
+  allowCancel: { type: Boolean, default: true }
 })
 
 const open = defineModel('open', { type: Boolean, default: false })
@@ -174,6 +197,16 @@ const totalAmountCents = computed(() => status.value?.totalAmountCents ?? props.
 const balanceCents = computed(() => status.value?.balanceCents ?? props.batch?.balanceCents ?? 0)
 const refundedCents = computed(() => status.value?.refundedCents ?? 0)
 const insufficient = computed(() => balanceCents.value < totalAmountCents.value)
+
+// ⚠️ 余额不足只该挡住【余额支付】这一条路。
+//
+// 早先写的是 `paying || insufficient`，于是余额为 0 的账号（比如管理员自己）
+// 选中支付宝之后，「确认支付」仍然是禁用的：鼠标落在上面是个红色禁止标，
+// 而界面上没有一个字解释为什么。用户唯一能想到的结论是「支付宝这条路坏了」，
+// 实际上钱根本还没走到支付宝那一步。真机实测就是这么卡住的。
+const confirmDisabled = computed(() =>
+  paying.value || (method.value === 'balance' && insufficient.value)
+)
 
 // ── 「钱到了」与「纸出来了」是两件事，必须分开 ──
 //
@@ -253,6 +286,11 @@ watch(open, (v) => {
     refreshingQr.value = false
     qrError.value = ''
     method.value = 'balance'
+    // ⚠️ 必须一起复位，这是个「同一个组件实例连着开两次」的坑：
+    // 组件在父组件里是常驻的（只切 open），付完一次之后 paymentSettled
+    // 会一直停在 true —— 再打开一单，showSuccess 立刻为真，
+    // 用户看到的是上一单的「支付成功」，连支付方式都挑不了。
+    paymentSettled.value = false
   } else {
     stopPolling()
   }
@@ -496,6 +534,12 @@ async function closeAndCancel() {
     emit('paid')
   }
   open.value = false
+}
+
+// 「取消」按钮的两副面孔：作废订单并关闭，或者只关闭。见 allowCancel 的说明。
+function onCancelClick() {
+  if (props.allowCancel) return closeAndCancel()
+  close()
 }
 
 function close() {

@@ -2,7 +2,7 @@ services:
   # 单容器（AIO）形态：cupsd 与 cups-web 跑在同一个容器里，
   # entrypoint.sh 后台拉起 cupsd（带 watchdog），前台 exec /cups-web 作为 PID 1。
   cups:
-    image: hanxi/cups-web:latest
+    image: Mars666613/cups-web:latest
     container_name: cups
     # 必须 root：容器内要跑 cupsd、lpadmin、dpkg（驱动安装），
     # 还要往 /usr/lib/cups、/usr/share/ppd 等系统路径写驱动文件。

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>前端尚未构建 · cups-web</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font: 15px/1.7 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f6f7f9; color: #1f2430; padding: 1.5rem;
+  }
+  @media (prefers-color-scheme: dark) { body { background: #16181d; color: #e6e8ec; } .card { background: #1e2128; border-color: #2c3038; } code { background: #262a32; } }
+  .card { max-width: 44rem; background: #fff; border: 1px solid #e3e6ea; border-radius: 12px; padding: 2rem; }
+  h1 { font-size: 1.25rem; margin: 0 0 .75rem; }
+  p { margin: .75rem 0; }
+  code { background: #f1f3f5; padding: .15em .45em; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+  pre { background: #f1f3f5; padding: .9rem 1rem; border-radius: 8px; overflow-x: auto; font-size: .875rem; }
+  @media (prefers-color-scheme: dark) { pre { background: #262a32; } }
+  .muted { color: #6b7280; font-size: .875rem; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>前端还没构建</h1>
+
+  <p>你现在看到的是这个页面，而不是真正的应用 —— 因为服务端二进制里
+     嵌入的是<b>占位文件</b>，不是构建好的前端。</p>
+
+  <p>服务端用 <code>//go:embed dist/**</code> 把前端打进二进制，所以
+     <code>frontend/dist/</code> 必须有东西才能编译。仓库里放了这一个占位页，
+     就是为了让<b>刚克隆下来的仓库能直接 <code>go build</code></b>，
+     而不是报一句看不懂的 <code>pattern dist/**: no matching files found</code>。</p>
+
+  <p><b>解决：先前端，再后端。</b></p>
+  <pre>make all          # 前端 dist + Go 二进制，顺序已经排好了</pre>
+
+  <p class="muted">或者只重建前端：<code>make frontend</code>（需要 Bun 或 npm）。
+     开发时也可以用 <code>bun run dev</code> 起 Vite 开发服务器，走 <code>:5173</code>。</p>
+
+  <p class="muted">如果你正在为本项目贡献代码：构建之后 <code>git status</code> 会显示
+     这个文件被改过 —— 那是正常的（Vite 就写在这个路径）。<b>请不要提交构建产物。</b></p>
+</div>
+</body>
+</html>

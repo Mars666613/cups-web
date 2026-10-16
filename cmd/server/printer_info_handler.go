@@ -3,9 +3,46 @@ package main
 import (
 	"log"
 	"net/http"
+	"strings"
 
 	"cups-web/internal/ipp"
 )
+
+// msgPrinterInfoFailed 是读取打印机信息失败时给用户看的话。
+//
+// 🚫 不要退回成英文的 "failed to get printer info"：这句话原样弹在界面上，
+// 用户既看不懂也无法转述，只能截图问人。而它本该回答的是「谁出问题了、
+// 我现在该做什么」—— 出问题的不是打印机，是我们到 CUPS 的这一跳。
+const msgPrinterInfoFailed = "读取打印机信息失败：打印服务没有及时响应，请稍后重试"
+
+// ippFailureHint 把底层错误归一句类，只写进服务端日志。
+//
+// 归类刻意做得粗：它的用途是让下一次故障的排查从「读一整串 error 字符串」
+// 变成「一眼看出是哪一段断了」。真正的错误原文紧随其后，不会丢。
+func ippFailureHint(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "awaiting response headers"),
+		strings.Contains(s, "deadline exceeded"),
+		strings.Contains(s, "timeout"):
+		return "对端没有在超时内回话：cupsd 或它前面的链路卡住"
+	case strings.Contains(s, "connection refused"):
+		return "对端拒连：该端口上没有服务在监听（CUPS_HOST 写错了？cupsd 没起来？）"
+	case strings.Contains(s, "no such host"):
+		return "主机名解析失败（CUPS_HOST 写错了？）"
+	case strings.Contains(s, "connection reset"), strings.Contains(s, "EOF"):
+		return "连接被对端中断"
+	case strings.Contains(s, "ssrf"), strings.Contains(s, "blocked"):
+		return "目标地址被出站策略拒绝"
+	case strings.Contains(s, "http status"), strings.Contains(s, "ipp error"):
+		return "对端有回应，但拒绝了这个请求"
+	default:
+		return "未分类"
+	}
+}
 
 // printerInfoHandler handles GET /api/printer-info?uri=<printer_uri>
 // It queries the printer via IPP Get-Printer-Attributes and returns structured info.
@@ -24,8 +61,13 @@ func printerInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// 不把底层错误（含 SSRF 策略细节 / 内网探测信息）回显给客户端，
 		// 仅记服务端日志，对外返回泛化提示。
-		log.Printf("[printer-info] GetPrinterAttributes error: %v", err)
-		writeJSONError(w, http.StatusBadGateway, "failed to get printer info")
+		//
+		// ⚠️ 日志里补一句【失败分类】。实测这个接口偶发 502，而原始错误
+		// （`http post: Post "...": net/http: timeout awaiting response headers`）
+		// 需要读进去才知道方向 —— 「对端不回话」和「cupsd 没在监听」是两条
+		// 完全不同的排查路线，而它们都会走到这一行。分类只进日志，不进响应。
+		log.Printf("[printer-info] 读取失败 uri=%q: %v（%s）", uri, err, ippFailureHint(err))
+		writeJSONError(w, http.StatusBadGateway, msgPrinterInfoFailed)
 		return
 	}
 
