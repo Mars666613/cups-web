@@ -35,11 +35,26 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # ── 登录 Docker Hub ────────────────────────────────────────────
+      # 不用 docker/login-action，自己规范化后再走 --password-stdin：
+      #   - 在管理界面粘贴 secret 时很容易带进看不见的换行/空格，而 GitHub
+      #     不会 trim。空白混进 Basic 认证头会让 docker 报
+      #     「malformed HTTP Authorization header」—— 那句话不指向根因，
+      #     会让人以为是 token 本身坏了。
+      #   - --password-stdin 也避免口令出现在进程列表里。
+      # tr -d '[:space:]' 只去空白，不改动 token 的任何有效字符。
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_PASS: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          user=$(printf '%s' "$DH_USER" | tr -d '[:space:]')
+          pass=$(printf '%s' "$DH_PASS" | tr -d '[:space:]')
+          if [ -z "$user" ] || [ -z "$pass" ]; then
+            echo "::error::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN 为空，请检查仓库 Secrets"
+            exit 1
+          fi
+          printf '%s' "$pass" | docker login --username "$user" --password-stdin
 
       # 镜像 tag / VERSION：v* tag 推送用 tag 名（vX.Y.Z）并追加 latest；
       # main 分支推送统一用 dev——不能拿分支名当 tag 名，
