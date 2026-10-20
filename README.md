@@ -683,7 +683,7 @@ Docker 默认卷映射：
 | 读卡器 | 用哪个 | 说明 |
 | --- | --- | --- |
 | **PC/SC 读卡器**（ACR122U 等，插上走 pcscd） | [`scripts/kiosk/kiosk.py`](scripts/kiosk/kiosk.py) | **推荐**。读出来的是卡片统一 UID，**不受键盘布局影响** |
-| **键盘模拟读卡器**（HID，刷卡相当于敲一串字符） | [`cmd/kiosk/`](cmd/kiosk/) 编译出的二进制 | 纯 Go、零运行时依赖，从 [Releases](../../releases) 下载对应架构（`cups-kiosk-linux-arm64` / `-armv7`）即可。⚠️ 它会受机器的**键盘布局**影响，同一张卡在不同机器上可能读出不同字符串 |
+| **键盘模拟读卡器**（HID，刷卡相当于敲一串字符） | [`cmd/kiosk/`](cmd/kiosk/) 编译出的二进制 | 纯 Go、零运行时依赖，从 [Releases](../../releases) 下载对应架构的 `cups-kiosk-linux-*`（amd64 / arm64 / armv7 / loong64）即可。⚠️ 它会受机器的**键盘布局**影响，同一张卡在不同机器上可能读出不同字符串 |
 
 两种都有现成的安装脚本与 systemd 单元，都在 [`scripts/kiosk/`](scripts/kiosk/)：`install.sh`（装程序 + 服务）与 `cups-kiosk.service`。install.sh **不替你写配置** —— token 是每台终端独有的。
 

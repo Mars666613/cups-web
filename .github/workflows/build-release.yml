@@ -102,7 +102,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cups-web-${{ matrix.suffix }}
-          path: cups-web-${{ matrix.suffix }}
+          # ⚠️ 取件终端也要进 Release：README 让人从 Releases 下载
+          # cups-kiosk-linux-*，只传 cups-web 的话那个链接是空的。
+          # 它只在 linux 上构建，其他平台没有这个文件 —— 用多行路径 +
+          # if-no-files-found: warn，避免 darwin / windows 因缺文件报错。
+          path: |
+            cups-web-${{ matrix.suffix }}
+            cups-kiosk-${{ matrix.suffix }}
+          if-no-files-found: warn
 
   release:
     name: Create Release
