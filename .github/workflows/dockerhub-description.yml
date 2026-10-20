@@ -3,13 +3,15 @@ name: Update Docker Hub Description
 permissions:
   contents: read
 
+# 只在手动触发时运行。
+#
+# 原先 push main 且 README 有改动就自动跑，但它依赖第三方 action 直接吃
+# DOCKERHUB_* 两个 secret：值里带一点看不见的空白就会认证失败（同
+# docker-publish.yml 修过的那个问题），而这里拿不到中间层做规范化 ——
+# 于是每改一次 README 就挂一个红叉，而它只负责更新 Docker Hub 页面上的
+# 项目简介，跟镜像完全无关。
+# 需要更新简介时，在 Actions 里手动 Run workflow，或在 Docker Hub 网页上改。
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'README.md'
-      - '.github/workflows/dockerhub-description.yml'
   workflow_dispatch:
 
 jobs:
