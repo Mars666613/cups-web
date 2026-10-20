@@ -2,6 +2,30 @@
 
 <div align="center">
 
+![Release](https://img.shields.io/github/v/release/Mars666613/cups-web?color=2ea043)
+![Docker Pulls](https://img.shields.io/docker/pulls/Mars666613/cups-web)
+![Image Size](https://img.shields.io/docker/image-size/Mars666613/cups-web/latest)
+![Stars](https://img.shields.io/github/stars/Mars666613/cups-web)
+![Forks](https://img.shields.io/github/forks/Mars666613/cups-web)
+![Issues](https://img.shields.io/github/issues/Mars666613/cups-web)
+![Last Commit](https://img.shields.io/github/last-commit/Mars666613/cups-web)
+![Downloads](https://img.shields.io/github/downloads/Mars666613/cups-web/total)
+![License](https://img.shields.io/github/license/Mars666613/cups-web)
+
+![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)
+![Vue](https://img.shields.io/badge/Vue-3.5-4FC08D?logo=vuedotjs&logoColor=white)
+![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
+![Nuxt UI](https://img.shields.io/badge/Nuxt_UI-v4-00DC82?logo=nuxt&logoColor=white)
+![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-v4-06B6D4?logo=tailwindcss&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
+![CUPS](https://img.shields.io/badge/CUPS-2.4-2D6B8B)
+![IPP](https://img.shields.io/badge/IPP-2.0-2D6B8B)
+![Docker](https://img.shields.io/badge/Docker-amd64_/_arm64_/_armv7-2496ED?logo=docker&logoColor=white)
+
+[GitHub](https://github.com/Mars666613/cups-web) · [Docker Hub](https://hub.docker.com/r/mars666613/cups-web) · [开发文档](AGENTS.md) · [深度文档](docs/README.md)
+
+</div>
+
 > ### 关于本分支
 >
 > 本项目基于 **[hanxi/cups-web](https://github.com/hanxi/cups-web)** 二次开发。原项目由 [涵曦](https://github.com/hanxi) 创作，采用 MIT 许可证 —— 感谢原作者。
@@ -925,6 +949,10 @@ docker compose logs -f cups
 ## 📈 Star History
 
 <div align="center">
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Mars666613/cups-web&type=Date)](https://star-history.com/#Mars666613/cups-web&Date)
+
+</div>
 
 ## ⭐ Star 项目
 
