@@ -80,7 +80,12 @@ jobs:
         with:
           context: ./
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          # 分支构建（dev）只出 amd64：GitHub 的托管 runner 是 x86，arm64 /
+          # armv7 要在 QEMU 里模拟，而本镜像还要源码编译 CUPS、apt 装
+          # LibreOffice + Java + 整套打印驱动 —— 模拟下两三个架构跑一两个
+          # 小时是常态，而 dev 是每次 push 都出的滚动包，不值得。
+          # 正式 release（v* tag）才出三架构，与 README 承诺保持一致。
+          platforms: ${{ github.ref_type == 'tag' && 'linux/amd64,linux/arm64,linux/arm/v7' || 'linux/amd64' }}
           push: true
           build-args: |
             VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
