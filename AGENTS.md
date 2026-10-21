@@ -1218,7 +1218,7 @@ make docker-build   # AIO 镜像
 
 ### docker-compose
 
-单服务 `cups`（AIO），`image: Mars666613/cups-web:latest`，`network_mode: host`（mDNS 组播需要，CUPS 直接占用宿主 `631`，Web 由 `LISTEN_ADDR` 决定、默认 `:1180`，issue #107）。
+单服务 `cups`（AIO），`image: mars666613/cups-web:latest`，`network_mode: host`（mDNS 组播需要，CUPS 直接占用宿主 `631`，Web 由 `LISTEN_ADDR` 决定、默认 `:1180`，issue #107）。
 
 | 配置 | 为什么 |
 | --- | --- |

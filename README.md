@@ -3,8 +3,8 @@
 <div align="center">
 
 ![Release](https://img.shields.io/github/v/release/Mars666613/cups-web?color=2ea043)
-![Docker Pulls](https://img.shields.io/docker/pulls/Mars666613/cups-web)
-![Image Size](https://img.shields.io/docker/image-size/Mars666613/cups-web/latest)
+![Docker Pulls](https://img.shields.io/docker/pulls/mars666613/cups-web)
+![Image Size](https://img.shields.io/docker/image-size/mars666613/cups-web/latest)
 ![Stars](https://img.shields.io/github/stars/Mars666613/cups-web)
 ![Forks](https://img.shields.io/github/forks/Mars666613/cups-web)
 ![Issues](https://img.shields.io/github/issues/Mars666613/cups-web)
@@ -338,7 +338,7 @@ docker exec cups driver-remove canon-ufr2
 ```yaml
 services:
   cups:
-    image: Mars666613/cups-web:latest
+    image: mars666613/cups-web:latest
     container_name: cups
     user: root
     hostname: CUPS
@@ -393,7 +393,7 @@ services:
 wget https://raw.githubusercontent.com/Mars666613/cups-web/main/docker-compose.yml
 ```
 
-> 💡 镜像标签：`latest` = 最新正式发行版（v* tag）；`dev` = main 分支最新构建（每次 push 更新，尝鲜用）。`docker-compose.yml` 默认用 `latest`，想试 dev 版本时把 `image: Mars666613/cups-web:latest` 改成 `image: Mars666613/cups-web:dev` 即可。
+> 💡 镜像标签：`latest` = 最新正式发行版（v* tag）；`dev` = main 分支最新构建（每次 push 更新，尝鲜用）。`docker-compose.yml` 默认用 `latest`，想试 dev 版本时把 `image: mars666613/cups-web:latest` 改成 `image: mars666613/cups-web:dev` 即可。
 
 ### 2. 配置环境变量
 
